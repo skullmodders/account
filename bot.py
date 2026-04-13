@@ -53,6 +53,16 @@ except ImportError:
     logger.error("Pyrogram not installed! Run: pip install pyrogram tgcrypto")
     sys.exit(1)
 
+# ── Phone Number Validation ───────────────────────────
+try:
+    import phonenumbers
+    from phonenumbers import NumberParseException
+    PHONENUMBERS_AVAILABLE = True
+    logger.info("phonenumbers library loaded successfully.")
+except ImportError:
+    PHONENUMBERS_AVAILABLE = False
+    logger.warning("phonenumbers not installed. Basic validation only. Run: pip install phonenumbers")
+
 # ── DNS Bypass ────────────────────────────────────────
 try:
     import dns.resolver
@@ -66,14 +76,28 @@ except Exception as e:
 
 
 # =====================================================
-# ⚙️ CONFIGURATION
+# ⚙️ CONFIGURATION — Load from Environment Variables
 # =====================================================
-API_ID = 35179842
-API_HASH = "be8263da0b299567112d75c488ebb72c"
-BOT_TOKEN = "8209606686:AAGCnV1mRBIGLPI7I8J5MknbjQWf9bIxO7w"
-ADMIN_IDS = [7385209456]
+API_ID = int(os.getenv("API_ID", "35179842"))
+API_HASH = os.getenv("API_HASH", "be8263da0b299567112d75c488ebb72c")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8209606686:AAGCnV1mRBIGLPI7I8J5MknbjQWf9bIxO7w")
+ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "7385209456")
+ADMIN_IDS = [int(x.strip()) for x in ADMIN_IDS_RAW.split(",") if x.strip().isdigit()]
+
+# Validate required config
+_missing = []
+if not API_ID:
+    _missing.append("API_ID")
+if not API_HASH:
+    _missing.append("API_HASH")
+if not BOT_TOKEN:
+    _missing.append("BOT_TOKEN")
+if _missing:
+    logger.critical(f"Missing required environment variables: {', '.join(_missing)}")
+    sys.exit(1)
+
 BOT_USERNAME = "SkullAdsBot"
-BOT_VERSION = "1.0"
+BOT_VERSION = "3.0"
 BOT_START_TIME = time.time()
 
 # ── Plan Configuration ────────────────────────────────
@@ -125,10 +149,10 @@ bot = Client(
 
 
 # =====================================================
-# 💾 JSON STORAGE ENGINE
+# 💾 JSON STORAGE ENGINE — Thread-Safe
 # =====================================================
 DATA_FILE = "data.json"
-DATA_LOCK = asyncio.Lock() if asyncio.get_event_loop().is_running() else None
+DATA_LOCK = asyncio.Lock()
 
 DEFAULT_DATA = {
     "users": {},
@@ -203,14 +227,15 @@ def load_data() -> dict:
         return loaded
     except json.JSONDecodeError as e:
         logger.error(f"JSON decode error: {e}")
-        # Try to recover from backup
         backup_file = DATA_FILE + ".backup"
         if os.path.exists(backup_file):
             try:
                 with open(backup_file, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception:
-                pass
+                    recovered = json.load(f)
+                logger.info("Recovered data from backup file.")
+                return recovered
+            except Exception as be:
+                logger.error(f"Backup recovery failed: {be}")
         return DEFAULT_DATA.copy()
     except Exception as e:
         logger.error(f"Load data error: {e}")
@@ -229,20 +254,17 @@ def save_data(data: dict) -> bool:
                 if old_content.strip():
                     with open(backup_file, "w", encoding="utf-8") as f:
                         f.write(old_content)
-            except Exception:
-                pass
+            except Exception as be:
+                logger.warning(f"Backup creation warning: {be}")
 
         temp_file = DATA_FILE + ".tmp"
         with open(temp_file, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
 
-        # Atomic rename
-        if os.path.exists(temp_file):
-            os.replace(temp_file, DATA_FILE)
+        os.replace(temp_file, DATA_FILE)
         return True
     except Exception as e:
         logger.error(f"Save data error: {e}")
-        # Fallback direct write
         try:
             with open(DATA_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
@@ -253,13 +275,25 @@ def save_data(data: dict) -> bool:
 
 
 def get_data() -> dict:
-    """Get current data."""
+    """Get current data (sync)."""
     return load_data()
 
 
 def update_data(data: dict) -> bool:
-    """Update data file."""
+    """Update data file (sync)."""
     return save_data(data)
+
+
+async def async_get_data() -> dict:
+    """Get data with async lock to prevent race conditions."""
+    async with DATA_LOCK:
+        return load_data()
+
+
+async def async_update_data(data: dict) -> bool:
+    """Update data with async lock to prevent race conditions."""
+    async with DATA_LOCK:
+        return save_data(data)
 
 
 # =====================================================
@@ -270,6 +304,151 @@ active_tasks = {}
 rate_limit_tracker = {}
 command_cooldowns = {}
 
+
+# =====================================================
+# 📱 PHONE NUMBER & OTP HELPERS
+# =====================================================
+# =====================================================
+# 📱 PHONE NUMBER & OTP HELPERS — BULLETPROOF
+# =====================================================
+def normalize_phone_number(raw: str) -> tuple:
+    """
+    Normalize phone number to E.164 format.
+    Returns (normalized_number, error_message)
+    normalized_number is None if invalid.
+    """
+    if not raw:
+        return None, "❌ Please send your phone number."
+
+    cleaned = raw.strip()
+
+    if PHONENUMBERS_AVAILABLE:
+        try:
+            # Try multiple parse strategies
+            parsed = None
+
+            # Strategy 1: Direct parse with +
+            if cleaned.startswith("+"):
+                try:
+                    parsed = phonenumbers.parse(cleaned, None)
+                except Exception:
+                    pass
+
+            # Strategy 2: Add + if missing
+            if parsed is None:
+                digits = ''.join(ch for ch in cleaned if ch.isdigit())
+                if digits:
+                    try:
+                        parsed = phonenumbers.parse("+" + digits, None)
+                    except Exception:
+                        pass
+
+            # Strategy 3: Try with IN region (India default)
+            if parsed is None:
+                try:
+                    parsed = phonenumbers.parse(cleaned, "IN")
+                except Exception:
+                    pass
+
+            if parsed is None:
+                return None, (
+                    "❌ <b>Cannot parse phone number!</b>\n\n"
+                    "┌─────────────────────\n"
+                    "│ Please send with country code.\n"
+                    "│\n"
+                    "│ <b>Examples:</b>\n"
+                    "│ • <code>+919876543210</code>\n"
+                    "│ • <code>919876543210</code>\n"
+                    "│ • <code>9876543210</code>\n"
+                    "└─────────────────────"
+                )
+
+            if not phonenumbers.is_valid_number(parsed):
+                return None, (
+                    "❌ <b>Invalid phone number!</b>\n\n"
+                    "┌─────────────────────\n"
+                    "│ Number doesn't seem valid.\n"
+                    "│ Check and try again.\n"
+                    "│\n"
+                    "│ <b>Examples:</b>\n"
+                    "│ • <code>+919876543210</code>\n"
+                    "│ • <code>919876543210</code>\n"
+                    "└─────────────────────"
+                )
+
+            e164 = phonenumbers.format_number(
+                parsed, phonenumbers.PhoneNumberFormat.E164
+            )
+            return e164, None
+
+        except Exception as e:
+            logger.warning(f"Phone normalization error: {e}")
+            # Fallback to basic
+            pass
+
+    # Basic fallback without phonenumbers library
+    digits_only = ''.join(ch for ch in cleaned if ch.isdigit())
+
+    if len(digits_only) < 7 or len(digits_only) > 15:
+        return None, (
+            "❌ <b>Invalid phone number!</b>\n\n"
+            "Include country code.\n"
+            "Example: <code>+919876543210</code>"
+        )
+
+    normalized = "+" + digits_only
+    return normalized, None
+
+
+def normalize_otp(raw: str) -> tuple:
+    """
+    Normalize OTP — accept ANY format.
+    Extracts only digits. Works with:
+    - 12345
+    - 1 2 3 4 5
+    - 1-2-3-4-5
+    - 12 345
+    - 1.2.3.4.5
+    - otp: 12345
+    - "12345"
+    Returns (otp_digits, error_message)
+    """
+    if not raw:
+        return None, "❌ Please send the OTP."
+
+    # Extract ONLY digits from raw text
+    digits = ""
+    for ch in raw:
+        if ch.isdigit():
+            digits += ch
+
+    if not digits:
+        return None, (
+            "❌ <b>No digits found in OTP!</b>\n\n"
+            "┌─────────────────────\n"
+            "│ Just send the OTP digits:\n"
+            "│ • <code>12345</code>\n"
+            "│ • <code>1 2 3 4 5</code>\n"
+            "│ • <code>1-2-3-4-5</code>\n"
+            "└─────────────────────"
+        )
+
+    if len(digits) < 4:
+        return None, (
+            f"❌ <b>OTP too short!</b>\n\n"
+            f"Got only <code>{len(digits)}</code> digits: <code>{digits}</code>\n"
+            f"OTP should be 5-6 digits."
+        )
+
+    if len(digits) > 8:
+        return None, (
+            f"❌ <b>OTP too long!</b>\n\n"
+            f"Got <code>{len(digits)}</code> digits.\n"
+            f"OTP should be 5-6 digits.\n"
+            f"Send only the OTP, nothing else."
+        )
+
+    return digits, None
 
 # =====================================================
 # 🛠️ HELPER FUNCTIONS
@@ -387,7 +566,7 @@ def get_active_account(user_id: int) -> tuple:
 
 
 def is_rate_limited(user_id: int, action: str = "general", cooldown: int = 3) -> bool:
-    """Check if user is rate limited."""
+    """Check if user is rate limited for a specific action."""
     key = f"{user_id}_{action}"
     now = time.time()
     last_time = rate_limit_tracker.get(key, 0)
@@ -410,7 +589,6 @@ def add_admin_log(action: str, admin_id: int, details: str = ""):
         "epoch": int(time.time())
     }
     data["admin_logs"].insert(0, log_entry)
-    # Keep only last 500 logs
     data["admin_logs"] = data["admin_logs"][:500]
     update_data(data)
 
@@ -437,8 +615,8 @@ async def check_access(user_id: int, msg_or_query) -> bool:
                 await msg_or_query.answer(msg, show_alert=True)
             else:
                 await msg_or_query.reply_text(msg, parse_mode=ParseMode.HTML)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"check_access ban reply error: {e}")
         return False
 
     # Check maintenance
@@ -456,20 +634,37 @@ async def check_access(user_id: int, msg_or_query) -> bool:
                 await msg_or_query.answer(msg, show_alert=True)
             else:
                 await msg_or_query.reply_text(msg, parse_mode=ParseMode.HTML)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"check_access maintenance reply error: {e}")
         return False
 
-    # Check force join channel
+    # Check force join channel — proper error handling
     force_channel = data["settings"].get("force_join_channel", "")
     if force_channel:
         try:
             member = await bot.get_chat_member(force_channel, user_id)
-            if member.status in [
-                ChatMemberStatus.LEFT, ChatMemberStatus.BANNED
-            ]:
+            # User is banned from channel
+            if member.status == ChatMemberStatus.BANNED:
+                msg = (
+                    "💀 <b>Access Restricted!</b>\n\n"
+                    "┌─────────────────────\n"
+                    f"│ 🚫 You are banned in our channel.\n"
+                    f"│ Contact @skullmodder for help.\n"
+                    "└─────────────────────"
+                )
+                try:
+                    if isinstance(msg_or_query, CallbackQuery):
+                        await msg_or_query.answer(msg, show_alert=True)
+                    else:
+                        await msg_or_query.reply_text(msg, parse_mode=ParseMode.HTML)
+                except Exception:
+                    pass
+                return False
+            # User has left the channel
+            if member.status == ChatMemberStatus.LEFT:
                 raise UserNotParticipant
-        except (UserNotParticipant, Exception):
+        except UserNotParticipant:
+            # User genuinely not in channel
             msg = (
                 "💀 <b>Join Required!</b>\n\n"
                 "┌─────────────────────\n"
@@ -493,9 +688,20 @@ async def check_access(user_id: int, msg_or_query) -> bool:
                     await msg_or_query.reply_text(
                         msg, reply_markup=markup, parse_mode=ParseMode.HTML
                     )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Force join message error: {e}")
             return False
+        except (ChannelPrivate, PeerIdInvalid) as e:
+            # Channel config error — don't block user, log admin warning
+            logger.warning(
+                f"Force join channel '{force_channel}' config error: {e}. "
+                f"Check bot is admin in channel."
+            )
+            return True
+        except Exception as e:
+            # Other API errors — log but don't block user
+            logger.warning(f"Force join check error for user {user_id}: {e}")
+            return True
 
     return True
 
@@ -530,7 +736,11 @@ async def safe_send(user_id: int, text: str, markup=None):
 @bot.on_message(filters.command("start") & filters.private)
 async def start_cmd(client, message: Message):
     u_id = message.from_user.id
-    data = get_data()
+    data = await async_get_data()
+
+    # Rate limit /start spam
+    if is_rate_limited(u_id, "start", 2):
+        return
 
     # Register new user
     is_new = str(u_id) not in data["users"]
@@ -565,7 +775,7 @@ async def start_cmd(client, message: Message):
                     "date": time.strftime('%Y-%m-%d %H:%M:%S')
                 })
 
-    update_data(data)
+    await async_update_data(data)
 
     # Notify admins about new user
     if is_new:
@@ -590,8 +800,8 @@ async def start_cmd(client, message: Message):
                     f"└─────────────────────",
                     parse_mode=ParseMode.HTML
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"New user notify error: {e}")
 
     if not await check_access(u_id, message):
         return
@@ -668,8 +878,15 @@ async def check_join_cb(client, query: CallbackQuery):
 async def back_start_cb(client, query: CallbackQuery):
     if not await check_access(query.from_user.id, query):
         return
-    # Clear user state
     if query.from_user.id in user_state:
+        # Disconnect any pending client before clearing state
+        state = user_state[query.from_user.id]
+        tc = state.get("client")
+        if tc:
+            try:
+                await tc.disconnect()
+            except Exception:
+                pass
         del user_state[query.from_user.id]
     await send_welcome(query.message, is_edit=True)
 
@@ -824,7 +1041,7 @@ async def show_plans_cb(client, query: CallbackQuery):
             url="https://t.me/itsukiarai"
         )],
         [InlineKeyboardButton(
-            "🤖 Owner ",
+            "🤖 Owner",
             url="https://t.me/itsukiarai"
         )],
         [InlineKeyboardButton("🔙 Back", callback_data="back_start")]
@@ -840,8 +1057,15 @@ async def open_dash_cb(client, query: CallbackQuery):
     u_id = query.from_user.id
     if not await check_access(u_id, query):
         return
-    # Clear any stuck user_state
+    # Clear any stuck user_state safely
     if u_id in user_state:
+        state = user_state[u_id]
+        tc = state.get("client")
+        if tc:
+            try:
+                await tc.disconnect()
+            except Exception:
+                pass
         del user_state[u_id]
     await send_dash(query.message, u_id, is_edit=True)
 
@@ -887,7 +1111,6 @@ async def send_dash(msg_or_query, u_id: int, is_edit: bool = False):
         f"Select an option below:"
     )
 
-    # Dynamic launch/stop button
     if camp_status == "RUNNING":
         action_row = [
             InlineKeyboardButton("🛑 Stop Campaign", callback_data="stop_ads"),
@@ -1002,11 +1225,11 @@ async def select_acc_cb(client, query: CallbackQuery):
     if acc_key not in user_accs:
         return await query.answer("❌ Account not found!", show_alert=True)
 
-    data = get_data()
+    data = await async_get_data()
     if "active_account" not in data:
         data["active_account"] = {}
     data["active_account"][str(u_id)] = acc_key
-    update_data(data)
+    await async_update_data(data)
 
     phone = user_accs[acc_key].get("phone", "Unknown")
     await query.answer(f"✅ Active: {phone}", show_alert=True)
@@ -1049,76 +1272,84 @@ async def confirm_del_acc_cb(client, query: CallbackQuery):
     )
 
 
-# ── Delete Account ────────────────────────────────────
+# ── Delete Account — Fixed ────────────────────────────
 @bot.on_callback_query(filters.regex(r"^del_acc_(.+)$"))
 async def del_acc_cb(client, query: CallbackQuery):
     u_id = query.from_user.id
     acc_key = query.matches[0].group(1)
-    user_accs = get_user_accounts(u_id)
 
-    if acc_key not in user_accs:
+    data = await async_get_data()
+
+    # Verify account belongs to this user
+    acc = data["accounts"].get(acc_key)
+    if not acc or acc.get("user_id") != u_id:
         return await query.answer("❌ Account not found!", show_alert=True)
 
-    data = get_data()
-    acc = data["accounts"].get(acc_key)
-
-    if acc:
-        # Try to logout the session
-        try:
-            tc = Client(
-                f"del_{u_id}_{int(time.time())}",
-                api_id=API_ID,
-                api_hash=API_HASH,
-                session_string=acc['session'],
-                in_memory=True
-            )
-            await tc.connect()
-            # Restore profile for non-admins
-            if not is_admin(u_id):
-                try:
-                    old_name = acc.get('old_name', '')
-                    old_bio = acc.get('old_bio', '')
-                    if old_name:
-                        await tc.update_profile(first_name=old_name)
-                    if old_bio:
-                        await tc.update_profile(bio=old_bio)
-                except Exception:
-                    pass
-            try:
-                await tc.log_out()
-            except Exception:
-                pass
-            try:
-                await tc.disconnect()
-            except Exception:
-                pass
-        except Exception as e:
-            logger.warning(f"Del account cleanup error: {e}")
-
-        # Remove from data
-        del data["accounts"][acc_key]
-
-        # Update active account
-        active = data.get("active_account", {}).get(str(u_id))
-        if active == acc_key:
-            remaining = {
-                k: v for k, v in data["accounts"].items()
-                if v.get("user_id") == u_id
-            }
-            if remaining:
-                data["active_account"][str(u_id)] = list(remaining.keys())[0]
-            else:
-                data.get("active_account", {}).pop(str(u_id), None)
-
-        # Stop campaign if running
-        if data.get("campaigns", {}).get(str(u_id), {}).get("status") == "RUNNING":
-            if not get_user_accounts(u_id):
-                data["campaigns"][str(u_id)]["status"] = "PAUSED"
-
-        data["settings"]["lifetime_logouts"] = (
-            data["settings"].get("lifetime_logouts", 0) + 1
+    # Try to restore profile and logout session
+    try:
+        tc = Client(
+            f"del_{u_id}_{int(time.time())}",
+            api_id=API_ID,
+            api_hash=API_HASH,
+            session_string=acc['session'],
+            in_memory=True
         )
-        update_data(data)
+        await tc.connect()
+
+        # Restore original profile for non-admins
+        if not is_admin(u_id):
+            try:
+                old_name = acc.get('old_name', '')
+                old_bio = acc.get('old_bio', '')
+                if old_name:
+                    await tc.update_profile(first_name=old_name)
+                if old_bio is not None:
+                    await tc.update_profile(bio=old_bio)
+            except Exception as pe:
+                logger.warning(f"Profile restore error during delete: {pe}")
+
+        try:
+            await tc.log_out()
+        except Exception as lo_e:
+            logger.debug(f"Logout error (non-critical): {lo_e}")
+
+        try:
+            await tc.disconnect()
+        except Exception:
+            pass
+
+    except AuthKeyUnregistered:
+        logger.info(f"Session already expired for {acc_key}, proceeding with removal.")
+    except Exception as e:
+        logger.warning(f"Del account cleanup error: {e}")
+
+    # Remove from data using already-loaded data (not stale re-read)
+    del data["accounts"][acc_key]
+
+    # Determine remaining accounts for this user using updated in-memory data
+    remaining = {
+        k: v for k, v in data["accounts"].items()
+        if v.get("user_id") == u_id
+    }
+
+    # Update active account
+    current_active = data.get("active_account", {}).get(str(u_id))
+    if current_active == acc_key:
+        if remaining:
+            data["active_account"][str(u_id)] = list(remaining.keys())[0]
+        else:
+            data.get("active_account", {}).pop(str(u_id), None)
+
+    # Pause campaign if no accounts left
+    if not remaining:
+        if data.get("campaigns", {}).get(str(u_id), {}).get("status") == "RUNNING":
+            data["campaigns"][str(u_id)]["status"] = "PAUSED"
+            logger.info(f"Campaign paused for user {u_id} — no accounts left.")
+
+    data["settings"]["lifetime_logouts"] = (
+        data["settings"].get("lifetime_logouts", 0) + 1
+    )
+    await async_update_data(data)
 
     await query.answer("✅ Account removed!", show_alert=True)
     await accounts_menu_cb(client, query)
@@ -1154,18 +1385,22 @@ async def login_btn(client, query: CallbackQuery):
         ])
         return await safe_edit(query.message, text, markup)
 
-    user_state[u_id] = {"step": "wait_phone"}
+    user_state[u_id] = {"step": "wait_phone", "_created": time.time()}
     await safe_edit(
         query.message,
         "💀 <b>Skull Ads — Secure Login</b>\n\n"
         "┌─────────────────────\n"
-        "│ 📱 Send your phone number\n"
-        "│ with country code.\n"
+        "│ 📱 Send your phone number.\n"
         "│\n"
-        "│ <b>Example:</b> <code>+919876543210</code>\n"
+        "│ <b>Any format works!</b>\n"
+        "│ • <code>+919876543210</code>\n"
+        "│ • <code>919876543210</code>\n"
+        "│ • <code>9876543210</code>\n"
+        "│ • <code>+1 202 555 1234</code>\n"
+        "│ • <code>91 98765-43210</code>\n"
         "│\n"
-        "│ 🔒 Your data is encrypted\n"
-        "│ and never shared.\n"
+        "│ ✅ Bot will auto-format your number.\n"
+        "│ 🔒 Your data is encrypted.\n"
         "└─────────────────────\n\n"
         "⚠️ Type /cancel to abort.",
         InlineKeyboardMarkup([
@@ -1175,13 +1410,13 @@ async def login_btn(client, query: CallbackQuery):
 
 
 async def finish_login(message: Message, tc, u_id: int, phone: str):
-    """Complete login process."""
+    """Complete login process — Fixed profile fetch and bio save."""
     try:
         sess = await tc.export_session_string()
     except Exception as e:
         logger.error(f"Export session error: {e}")
         await message.reply_text(
-            "❌ <b>Login failed during session export.</b>",
+            "❌ <b>Login failed during session export.</b>\nPlease try again.",
             parse_mode=ParseMode.HTML
         )
         try:
@@ -1192,31 +1427,41 @@ async def finish_login(message: Message, tc, u_id: int, phone: str):
             del user_state[u_id]
         return
 
+    # Properly fetch existing profile before modifying
     old_name = ""
     old_bio = ""
     try:
         me = await tc.get_me()
         old_name = me.first_name or ""
-    except Exception:
-        pass
+        # Fetch full user info to get bio
+        try:
+            full_user = await tc.get_chat(me.id)
+            old_bio = full_user.bio or ""
+        except Exception as bio_e:
+            logger.debug(f"Bio fetch error (non-critical): {bio_e}")
+            old_bio = ""
+    except Exception as me_e:
+        logger.warning(f"get_me() error during finish_login: {me_e}")
 
     # Update profile for non-admins
     if not is_admin(u_id):
         try:
             new_name = old_name
-            if "SkullAdsBot" not in old_name:
+            if old_name and "SkullAdsBot" not in old_name:
                 new_name = f"{old_name} | @SkullAdsBot ☠️"
+            elif not old_name:
+                new_name = "@SkullAdsBot ☠️"
             await tc.update_profile(
                 first_name=new_name,
                 bio="💀 Aᴜᴛᴏᴍᴀᴛᴇᴅ Aᴅs Vɪᴀ @SkullAdsBot ☠️ | @skullmodder"
             )
         except Exception as e:
-            logger.warning(f"Profile update error: {e}")
+            logger.warning(f"Profile update error (non-critical): {e}")
     else:
         logger.info("👑 Admin Login: Profile update bypassed.")
 
     acc_key = f"{u_id}_{phone.replace('+', '').replace(' ', '')}"
-    data = get_data()
+    data = await async_get_data()
 
     data["settings"]["lifetime_logins"] = (
         data["settings"].get("lifetime_logins", 0) + 1
@@ -1237,7 +1482,7 @@ async def finish_login(message: Message, tc, u_id: int, phone: str):
     if str(u_id) not in data["campaigns"]:
         data["campaigns"][str(u_id)] = {"status": "IDLE"}
 
-    update_data(data)
+    await async_update_data(data)
 
     try:
         await tc.disconnect()
@@ -1428,11 +1673,11 @@ async def view_targets_cb(client, query: CallbackQuery):
 @bot.on_callback_query(filters.regex("^clear_targets$"))
 async def clear_targets_cb(client, query: CallbackQuery):
     u_id = query.from_user.id
-    data = get_data()
+    data = await async_get_data()
     if str(u_id) in data["campaigns"]:
         data["campaigns"][str(u_id)]["targets"] = []
         data["campaigns"][str(u_id)].pop("cache_grps", None)
-        update_data(data)
+        await async_update_data(data)
     await query.answer("✅ All targets cleared!", show_alert=True)
     await target_menu_cb(client, query)
 
@@ -1441,6 +1686,11 @@ async def clear_targets_cb(client, query: CallbackQuery):
 @bot.on_callback_query(filters.regex("^fetch_groups$"))
 async def fetch_groups_cb(client, query: CallbackQuery):
     u_id = query.from_user.id
+
+    # Rate limit to prevent spam clicks
+    if is_rate_limited(u_id, "fetch_groups", 10):
+        return await query.answer("⏳ Please wait before fetching again.", show_alert=True)
+
     data = get_data()
     active_key, active_acc = get_active_account(u_id)
 
@@ -1479,14 +1729,12 @@ async def fetch_groups_cb(client, query: CallbackQuery):
                 ]:
                     grps.append({
                         "id": str(d.chat.id),
-                        "title": truncate_text(
-                            d.chat.title or "Unknown", 25
-                        ),
+                        "title": truncate_text(d.chat.title or "Unknown", 25),
                         "sel": True,
                         "members": getattr(d.chat, 'members_count', 0) or 0
                     })
         except Exception as e:
-            logger.warning(f"Dialog scan error: {e}")
+            logger.warning(f"Dialog scan error for user {u_id}: {e}")
 
         try:
             await tc.disconnect()
@@ -1512,14 +1760,13 @@ async def fetch_groups_cb(client, query: CallbackQuery):
                 ])
             )
 
-        # Sort by member count descending
         grps.sort(key=lambda x: x.get("members", 0), reverse=True)
 
-        data = get_data()
+        data = await async_get_data()
         if str(u_id) not in data["campaigns"]:
             data["campaigns"][str(u_id)] = {"status": "IDLE"}
         data["campaigns"][str(u_id)]["cache_grps"] = grps
-        update_data(data)
+        await async_update_data(data)
 
         await show_group_page(query.message, u_id, 0)
 
@@ -1529,12 +1776,11 @@ async def fetch_groups_cb(client, query: CallbackQuery):
                 await tc.disconnect()
         except Exception:
             pass
-        # Remove invalid session
-        data = get_data()
+        data = await async_get_data()
         if active_key and active_key in data["accounts"]:
             del data["accounts"][active_key]
             data.get("active_account", {}).pop(str(u_id), None)
-            update_data(data)
+            await async_update_data(data)
         await safe_edit(
             query.message,
             "💀 <b>Session Expired!</b>\n\n"
@@ -1557,7 +1803,7 @@ async def fetch_groups_cb(client, query: CallbackQuery):
                 await tc.disconnect()
         except Exception:
             pass
-        logger.error(f"Fetch groups error: {e}")
+        logger.error(f"Fetch groups error for user {u_id}: {e}")
         await safe_edit(
             query.message,
             f"💀 <b>Fetch Error!</b>\n\n"
@@ -1599,7 +1845,6 @@ async def show_group_page(message, u_id: int, page: int):
             )
         ])
 
-    # Navigation
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton(
@@ -1615,7 +1860,6 @@ async def show_group_page(message, u_id: int, page: int):
     if nav:
         buttons.append(nav)
 
-    # Action buttons
     all_selected = selected_count == len(grps)
     buttons.extend([
         [InlineKeyboardButton(
@@ -1649,7 +1893,7 @@ async def tg_handler_cb(client, query: CallbackQuery):
     p1 = int(query.matches[0].group(2))
     p2 = query.matches[0].group(3)
 
-    data = get_data()
+    data = await async_get_data()
     grps = data["campaigns"].get(str(u_id), {}).get("cache_grps", [])
 
     if not grps:
@@ -1662,7 +1906,7 @@ async def tg_handler_cb(client, query: CallbackQuery):
             grps[p1]["sel"] = not grps[p1]["sel"]
         page = int(p2) if p2 else 0
         data["campaigns"][str(u_id)]["cache_grps"] = grps
-        update_data(data)
+        await async_update_data(data)
 
     elif action == "all":
         all_sel = all(g.get("sel") for g in grps)
@@ -1670,7 +1914,7 @@ async def tg_handler_cb(client, query: CallbackQuery):
             g["sel"] = not all_sel
         page = p1
         data["campaigns"][str(u_id)]["cache_grps"] = grps
-        update_data(data)
+        await async_update_data(data)
 
     elif action == "pg":
         page = p1
@@ -1681,7 +1925,7 @@ async def tg_handler_cb(client, query: CallbackQuery):
 @bot.on_callback_query(filters.regex("^confirm_targets$"))
 async def confirm_targets_cb(client, query: CallbackQuery):
     u_id = query.from_user.id
-    data = get_data()
+    data = await async_get_data()
     cache = data["campaigns"].get(str(u_id), {}).get("cache_grps", [])
     selected = [g["id"] for g in cache if g.get("sel")]
 
@@ -1690,7 +1934,6 @@ async def confirm_targets_cb(client, query: CallbackQuery):
             "⚠️ Select at least 1 group!", show_alert=True
         )
 
-    # Check plan limit
     plan_info = get_user_plan_info(u_id)
     max_targets = plan_info.get("max_targets", 50)
     if len(selected) > max_targets and not is_admin(u_id):
@@ -1701,9 +1944,8 @@ async def confirm_targets_cb(client, query: CallbackQuery):
         )
 
     data["campaigns"][str(u_id)]["targets"] = selected
-    # Clean up cache
     data["campaigns"][str(u_id)].pop("cache_grps", None)
-    update_data(data)
+    await async_update_data(data)
 
     await query.answer(
         f"✅ {len(selected)} Targets Saved!", show_alert=True
@@ -1720,7 +1962,6 @@ async def ask_ad_msg_cb(client, query: CallbackQuery):
     if not await check_access(u_id, query):
         return
 
-    # Show current ad if exists
     data = get_data()
     current_ad = data.get("campaigns", {}).get(str(u_id), {}).get("ad_html", "")
     preview = ""
@@ -1730,7 +1971,7 @@ async def ask_ad_msg_cb(client, query: CallbackQuery):
             f"<blockquote>{truncate_text(current_ad, 150)}</blockquote>"
         )
 
-    user_state[u_id] = {"step": "wait_ad_msg"}
+    user_state[u_id] = {"step": "wait_ad_msg", "_created": time.time()}
     await safe_edit(
         query.message,
         "💀 <b>Set Ad Message</b>\n\n"
@@ -1760,7 +2001,6 @@ async def start_wizard_cb(client, query: CallbackQuery):
     if not await check_access(u_id, query):
         return
 
-    # Show current settings if any
     data = get_data()
     camp = data.get("campaigns", {}).get(str(u_id), {})
     current = ""
@@ -1774,7 +2014,7 @@ async def start_wizard_cb(client, query: CallbackQuery):
             f"⏳ Delay: {d}s | ⏱️ Interval: {i}m | 🔄 Rounds: {r_str}"
         )
 
-    user_state[u_id] = {"step": "wiz_delay"}
+    user_state[u_id] = {"step": "wiz_delay", "_created": time.time()}
     await safe_edit(
         query.message,
         "💀 <b>Settings Wizard</b>\n\n"
@@ -1801,14 +2041,13 @@ async def start_wizard_cb(client, query: CallbackQuery):
     )
 
 
-# ── Quick Delay Buttons ───────────────────────────────
 @bot.on_callback_query(filters.regex(r"^quick_delay_(\d+)$"))
 async def quick_delay_cb(client, query: CallbackQuery):
     u_id = query.from_user.id
     delay = int(query.matches[0].group(1))
 
     if u_id not in user_state or user_state[u_id].get("step") != "wiz_delay":
-        user_state[u_id] = {"step": "wiz_delay"}
+        user_state[u_id] = {"step": "wiz_delay", "_created": time.time()}
 
     user_state[u_id].update({"delay": delay, "step": "wiz_interval"})
 
@@ -1838,14 +2077,13 @@ async def quick_delay_cb(client, query: CallbackQuery):
     )
 
 
-# ── Quick Interval Buttons ────────────────────────────
 @bot.on_callback_query(filters.regex(r"^quick_interval_(\d+)$"))
 async def quick_interval_cb(client, query: CallbackQuery):
     u_id = query.from_user.id
     interval_min = int(query.matches[0].group(1))
 
     if u_id not in user_state:
-        return await query.answer("Session expired!", show_alert=True)
+        user_state[u_id] = {"step": "wiz_interval", "_created": time.time()}
 
     user_state[u_id].update({
         "interval": interval_min * 60,
@@ -1885,16 +2123,16 @@ async def quick_interval_cb(client, query: CallbackQuery):
     )
 
 
-# ── Quick Rounds Buttons ──────────────────────────────
 @bot.on_callback_query(filters.regex(r"^quick_rounds_(\d+)$"))
 async def quick_rounds_cb(client, query: CallbackQuery):
     u_id = query.from_user.id
     rounds = int(query.matches[0].group(1))
 
     if u_id not in user_state:
-        return await query.answer("Session expired!", show_alert=True)
+        return await query.answer(
+            "⚠️ Session expired. Please restart settings.", show_alert=True
+        )
 
-    # Check plan limit
     plan_info = get_user_plan_info(u_id)
     max_rounds = plan_info.get("max_rounds", 5)
     if rounds > max_rounds and not is_admin(u_id):
@@ -1906,7 +2144,7 @@ async def quick_rounds_cb(client, query: CallbackQuery):
     d = user_state[u_id].get("delay", 10)
     i = user_state[u_id].get("interval", 600)
 
-    data = get_data()
+    data = await async_get_data()
     if str(u_id) not in data["campaigns"]:
         data["campaigns"][str(u_id)] = {"status": "IDLE"}
 
@@ -1916,7 +2154,7 @@ async def quick_rounds_cb(client, query: CallbackQuery):
         "total_rounds": rounds,
         "current_round": 1
     })
-    update_data(data)
+    await async_update_data(data)
 
     if u_id in user_state:
         del user_state[u_id]
@@ -1943,17 +2181,15 @@ async def quick_rounds_cb(client, query: CallbackQuery):
     )
 
 
-# ── Unlimited Rounds ──────────────────────────────────
 @bot.on_callback_query(filters.regex("^set_unlimited_rounds$"))
 async def unlimited_rounds_cb(client, query: CallbackQuery):
     u_id = query.from_user.id
 
     if u_id not in user_state:
         return await query.answer(
-            "Session expired. Please try again.", show_alert=True
+            "⚠️ Session expired. Please restart settings.", show_alert=True
         )
 
-    # Check plan
     plan_info = get_user_plan_info(u_id)
     if plan_info.get("max_rounds", 5) < 9999 and not is_admin(u_id):
         return await query.answer(
@@ -1964,7 +2200,7 @@ async def unlimited_rounds_cb(client, query: CallbackQuery):
     d = user_state[u_id].get("delay", 10)
     i = user_state[u_id].get("interval", 600)
 
-    data = get_data()
+    data = await async_get_data()
     if str(u_id) not in data["campaigns"]:
         data["campaigns"][str(u_id)] = {"status": "IDLE"}
 
@@ -1974,7 +2210,7 @@ async def unlimited_rounds_cb(client, query: CallbackQuery):
         "total_rounds": 9999999,
         "current_round": 1
     })
-    update_data(data)
+    await async_update_data(data)
 
     if u_id in user_state:
         del user_state[u_id]
@@ -2001,14 +2237,13 @@ async def unlimited_rounds_cb(client, query: CallbackQuery):
     )
 
 
-# ── Custom Links ──────────────────────────────────────
 @bot.on_callback_query(filters.regex("^ask_custom_links$"))
 async def ask_custom_links_cb(client, query: CallbackQuery):
     u_id = query.from_user.id
     if not await check_access(u_id, query):
         return
 
-    user_state[u_id] = {"step": "wait_custom_links"}
+    user_state[u_id] = {"step": "wait_custom_links", "_created": time.time()}
     await safe_edit(
         query.message,
         "💀 <b>Add Custom Group Links</b>\n\n"
@@ -2028,9 +2263,7 @@ async def ask_custom_links_cb(client, query: CallbackQuery):
             [InlineKeyboardButton("❌ Cancel", callback_data="target_menu")]
         ])
     )
-
-
-# =====================================================
+ # =====================================================
 # 🚀 CAMPAIGN LAUNCH & STOP
 # =====================================================
 @bot.on_callback_query(filters.regex("^launch_ads$"))
@@ -2038,6 +2271,10 @@ async def launch_ads_cb(client, query: CallbackQuery):
     u_id = query.from_user.id
     if not await check_access(u_id, query):
         return
+
+    # Rate limit launch button
+    if is_rate_limited(u_id, "launch", 5):
+        return await query.answer("⏳ Please wait before launching again.", show_alert=True)
 
     data = get_data()
     camp = data["campaigns"].get(str(u_id), {})
@@ -2066,7 +2303,6 @@ async def launch_ads_cb(client, query: CallbackQuery):
             "⚠️ Campaign is already running!", show_alert=True
         )
 
-    # Create progress tracker message
     total_targets = len(camp.get("targets", []))
     total_rounds = camp.get("total_rounds", 1)
     round_str = "♾️" if total_rounds > 9000000 else str(total_rounds)
@@ -2092,15 +2328,17 @@ async def launch_ads_cb(client, query: CallbackQuery):
         logger.error(f"Tracker message error: {e}")
         return await query.answer("❌ Failed to create tracker!", show_alert=True)
 
-    # Update campaign state
-    data = get_data()
+    # Update campaign state atomically
+    data = await async_get_data()
+    if str(u_id) not in data["campaigns"]:
+        data["campaigns"][str(u_id)] = {}
     data["campaigns"][str(u_id)]["status"] = "RUNNING"
     data["campaigns"][str(u_id)]["progress_msg_id"] = msg.id
     data["campaigns"][str(u_id)]["progress_chat_id"] = u_id
     data["campaigns"][str(u_id)]["current_round"] = camp.get("current_round", 1)
     data["campaigns"][str(u_id)]["active_acc_key"] = active_key
     data["campaigns"][str(u_id)]["launch_time"] = int(time.time())
-    update_data(data)
+    await async_update_data(data)
 
     await query.answer("🚀 Campaign Launched!", show_alert=True)
 
@@ -2113,14 +2351,14 @@ async def launch_ads_cb(client, query: CallbackQuery):
 @bot.on_callback_query(filters.regex("^stop_ads$"))
 async def stop_ads_cb(client, query: CallbackQuery):
     u_id = query.from_user.id
-    data = get_data()
+    data = await async_get_data()
 
     was_running = False
     if str(u_id) in data["campaigns"]:
         if data["campaigns"][str(u_id)].get("status") == "RUNNING":
             was_running = True
         data["campaigns"][str(u_id)]["status"] = "PAUSED"
-        update_data(data)
+        await async_update_data(data)
 
     if was_running:
         await safe_edit(
@@ -2149,6 +2387,11 @@ async def stop_ads_cb(client, query: CallbackQuery):
 @bot.on_callback_query(filters.regex("^refresh_tracker$"))
 async def refresh_tracker_cb(client, query: CallbackQuery):
     u_id = query.from_user.id
+
+    # Rate limit refresh spam
+    if is_rate_limited(u_id, "refresh_tracker", 3):
+        return await query.answer("⏳ Wait a moment...", show_alert=False)
+
     data = get_data()
     camp = data.get("campaigns", {}).get(str(u_id), {})
     stats = data["stats"].get(str(u_id), {"total_sent": 0, "failed": 0})
@@ -2161,7 +2404,10 @@ async def refresh_tracker_cb(client, query: CallbackQuery):
     total_targets = len(camp.get("targets", []))
     total_rounds = camp.get("total_rounds", 1)
     c_round = camp.get("current_round", 1)
-    round_str = f"{c_round}/♾️" if total_rounds > 9000000 else f"{c_round}/{total_rounds}"
+    round_str = (
+        f"{c_round}/♾️" if total_rounds > 9000000
+        else f"{c_round}/{total_rounds}"
+    )
 
     launch_time = camp.get("launch_time", int(time.time()))
     elapsed = get_readable_time(int(time.time() - launch_time))
@@ -2209,7 +2455,7 @@ async def update_tracker(u_id: int, msg_id: int, text: str):
     except MessageNotModified:
         pass
     except Exception as e:
-        logger.debug(f"Tracker update error: {e}")
+        logger.debug(f"Tracker update error for {u_id}: {e}")
 
 
 async def run_user_campaign(u_id: int):
@@ -2222,7 +2468,7 @@ async def run_user_campaign(u_id: int):
             camp = data["campaigns"].get(str(u_id), {})
 
             if not camp or camp.get("status") != "RUNNING":
-                logger.info(f"Campaign stopped for user {u_id}")
+                logger.info(f"Campaign stopped for user {u_id} — status changed")
                 break
 
             c_rnd = camp.get("current_round", 1)
@@ -2230,8 +2476,9 @@ async def run_user_campaign(u_id: int):
 
             # Check if all rounds completed
             if c_rnd > t_rnd and t_rnd <= 9000000:
+                data = await async_get_data()
                 data["campaigns"][str(u_id)]["status"] = "COMPLETED"
-                update_data(data)
+                await async_update_data(data)
                 await safe_send(
                     u_id,
                     "💀 <b>Campaign Complete!</b>\n\n"
@@ -2249,8 +2496,9 @@ async def run_user_campaign(u_id: int):
             acc = data["accounts"].get(acc_key) if acc_key else None
 
             if not acc:
+                data = await async_get_data()
                 data["campaigns"][str(u_id)]["status"] = "PAUSED"
-                update_data(data)
+                await async_update_data(data)
                 await safe_send(
                     u_id,
                     "💀 <b>Campaign Paused!</b>\n\n"
@@ -2263,20 +2511,23 @@ async def run_user_campaign(u_id: int):
 
             # Check maintenance
             if data["settings"].get("maintenance_mode") and not is_admin(u_id):
+                data = await async_get_data()
                 data["campaigns"][str(u_id)]["status"] = "PAUSED"
-                update_data(data)
+                await async_update_data(data)
                 break
 
             target_list = camp.get("targets", [])
             if not target_list:
+                data = await async_get_data()
                 data["campaigns"][str(u_id)]["status"] = "PAUSED"
-                update_data(data)
+                await async_update_data(data)
                 break
 
             ad_html = camp.get("ad_html", "")
             if not ad_html:
+                data = await async_get_data()
                 data["campaigns"][str(u_id)]["status"] = "PAUSED"
-                update_data(data)
+                await async_update_data(data)
                 break
 
             # Add global footer if set
@@ -2297,7 +2548,7 @@ async def run_user_campaign(u_id: int):
                 )
                 await tc.connect()
 
-                # Warmup - load dialogs
+                # Warmup
                 try:
                     count = 0
                     async for _ in tc.get_dialogs():
@@ -2309,12 +2560,12 @@ async def run_user_campaign(u_id: int):
 
             except AuthKeyUnregistered:
                 logger.warning(f"Auth key expired for user {u_id}")
-                data = get_data()
+                data = await async_get_data()
                 if acc_key and acc_key in data["accounts"]:
                     del data["accounts"][acc_key]
                 data.get("active_account", {}).pop(str(u_id), None)
                 data["campaigns"][str(u_id)]["status"] = "PAUSED"
-                update_data(data)
+                await async_update_data(data)
                 await safe_send(
                     u_id,
                     "💀 <b>Session Expired!</b>\n\n"
@@ -2325,8 +2576,9 @@ async def run_user_campaign(u_id: int):
                 )
                 break
             except FloodWait as e:
-                logger.warning(f"FloodWait on connect: {e.value}s")
-                await asyncio.sleep(min(e.value + 5, 300))
+                wait_secs = min(e.value + 5, 300)
+                logger.warning(f"FloodWait on connect for {u_id}: {wait_secs}s")
+                await asyncio.sleep(wait_secs)
                 continue
             except Exception as e:
                 logger.error(f"Campaign connect error ({u_id}): {e}")
@@ -2337,6 +2589,7 @@ async def run_user_campaign(u_id: int):
             snt, fld, skipped = 0, 0, 0
             total_targets = len(target_list)
             msg_id = camp.get("progress_msg_id")
+            session_expired = False
 
             round_display = (
                 f"<code>{c_rnd}</code>/♾️"
@@ -2346,8 +2599,8 @@ async def run_user_campaign(u_id: int):
 
             for i, target in enumerate(target_list, 1):
                 # Check if stopped
-                data = get_data()
-                current_status = data["campaigns"].get(
+                check_data = get_data()
+                current_status = check_data["campaigns"].get(
                     str(u_id), {}
                 ).get("status")
                 if current_status != "RUNNING":
@@ -2374,9 +2627,7 @@ async def run_user_campaign(u_id: int):
                     skipped += 1
                 except FloodWait as e:
                     wait_time = min(e.value + 5, 300)
-                    logger.warning(
-                        f"FloodWait for {u_id}: {wait_time}s"
-                    )
+                    logger.warning(f"FloodWait for {u_id}: {wait_time}s")
                     if msg_id:
                         await update_tracker(
                             u_id, msg_id,
@@ -2390,14 +2641,15 @@ async def run_user_campaign(u_id: int):
                     await asyncio.sleep(wait_time)
                     fld += 1
                 except AuthKeyUnregistered:
+                    logger.warning(f"Session expired mid-campaign for {u_id}")
+                    session_expired = True
                     fld += 1
-                    # Remove invalid session
-                    data = get_data()
+                    data = await async_get_data()
                     if acc_key and acc_key in data["accounts"]:
                         del data["accounts"][acc_key]
                     data.get("active_account", {}).pop(str(u_id), None)
                     data["campaigns"][str(u_id)]["status"] = "PAUSED"
-                    update_data(data)
+                    await async_update_data(data)
                     await safe_send(
                         u_id,
                         "💀 <b>Session Expired Mid-Campaign!</b>\n"
@@ -2406,8 +2658,13 @@ async def run_user_campaign(u_id: int):
                     break
                 except PeerIdInvalid:
                     skipped += 1
+                except Forbidden:
+                    skipped += 1
+                except RPCError as e:
+                    logger.warning(f"RPC error sending to {target}: {e}")
+                    fld += 1
                 except Exception as e:
-                    logger.debug(f"Send error: {e}")
+                    logger.debug(f"Send error to {target}: {e}")
                     fld += 1
 
                 # Update tracker every 3 groups or at end
@@ -2436,12 +2693,17 @@ async def run_user_campaign(u_id: int):
 
             # Disconnect session
             try:
-                await tc.disconnect()
+                if tc:
+                    await tc.disconnect()
             except Exception:
                 pass
 
-            # Save stats
-            data = get_data()
+            # If session expired mid-round, break out
+            if session_expired:
+                break
+
+            # Save stats atomically
+            data = await async_get_data()
             if str(u_id) not in data["stats"]:
                 data["stats"][str(u_id)] = {"total_sent": 0, "failed": 0}
             data["stats"][str(u_id)]["total_sent"] += snt
@@ -2454,7 +2716,7 @@ async def run_user_campaign(u_id: int):
 
             if current_status == "RUNNING":
                 data["campaigns"][str(u_id)]["current_round"] = c_rnd + 1
-                update_data(data)
+                await async_update_data(data)
 
                 # Check if more rounds needed
                 if c_rnd < t_rnd or t_rnd > 9000000:
@@ -2472,18 +2734,20 @@ async def run_user_campaign(u_id: int):
 
                     # Wait with periodic checks
                     waited = 0
+                    check_interval = 30
                     while waited < interval:
-                        await asyncio.sleep(min(30, interval - waited))
-                        waited += 30
+                        sleep_time = min(check_interval, interval - waited)
+                        await asyncio.sleep(sleep_time)
+                        waited += sleep_time
                         # Check if stopped during wait
-                        data = get_data()
-                        if data["campaigns"].get(
+                        check_data = get_data()
+                        if check_data["campaigns"].get(
                             str(u_id), {}
                         ).get("status") != "RUNNING":
                             break
                 else:
                     data["campaigns"][str(u_id)]["status"] = "COMPLETED"
-                    update_data(data)
+                    await async_update_data(data)
                     await safe_send(
                         u_id,
                         "💀 <b>Campaign Complete!</b>\n\n"
@@ -2493,7 +2757,7 @@ async def run_user_campaign(u_id: int):
                     )
                     break
             else:
-                update_data(data)
+                await async_update_data(data)
                 break
 
     except asyncio.CancelledError:
@@ -2501,6 +2765,23 @@ async def run_user_campaign(u_id: int):
     except Exception as e:
         logger.error(f"Campaign engine error ({u_id}): {e}")
         traceback.print_exc()
+        # Try to pause campaign on unhandled error
+        try:
+            data = await async_get_data()
+            if str(u_id) in data["campaigns"]:
+                data["campaigns"][str(u_id)]["status"] = "PAUSED"
+                await async_update_data(data)
+            await safe_send(
+                u_id,
+                f"💀 <b>Campaign Error!</b>\n\n"
+                f"┌─────────────────────\n"
+                f"│ ❌ Unexpected error occurred.\n"
+                f"│ Campaign has been paused.\n"
+                f"│ Try resuming from dashboard.\n"
+                f"└─────────────────────"
+            )
+        except Exception:
+            pass
     finally:
         if u_id in active_tasks:
             del active_tasks[u_id]
@@ -2508,7 +2789,7 @@ async def run_user_campaign(u_id: int):
 
 
 async def ad_engine():
-    """Main engine dispatcher - checks for campaigns to run."""
+    """Main engine dispatcher — checks for campaigns to run."""
     logger.info("🔥 Ad Engine started!")
     while True:
         try:
@@ -2535,7 +2816,15 @@ async def ad_engine():
 @bot.on_message(filters.command("cancel") & filters.private)
 async def cancel_cmd(client, message: Message):
     u_id = message.from_user.id
+    # Safely disconnect any pending login client
     if u_id in user_state:
+        state = user_state[u_id]
+        tc = state.get("client")
+        if tc:
+            try:
+                await tc.disconnect()
+            except Exception:
+                pass
         del user_state[u_id]
     await message.reply_text(
         "❌ <b>Action Cancelled.</b>",
@@ -2550,12 +2839,20 @@ async def cancel_cmd(client, message: Message):
 @bot.on_message(filters.command("reset") & filters.private)
 async def reset_cmd(client, message: Message):
     u_id = message.from_user.id
+    # Safely disconnect any pending login client
     if u_id in user_state:
+        state = user_state[u_id]
+        tc = state.get("client")
+        if tc:
+            try:
+                await tc.disconnect()
+            except Exception:
+                pass
         del user_state[u_id]
-    data = get_data()
+    data = await async_get_data()
     if str(u_id) in data["campaigns"]:
         data["campaigns"][str(u_id)]["status"] = "PAUSED"
-        update_data(data)
+        await async_update_data(data)
     await message.reply_text(
         "💀 <b>System Reset!</b>\n\n"
         "┌─────────────────────\n"
@@ -2574,6 +2871,10 @@ async def reset_cmd(client, message: Message):
 
 @bot.on_message(filters.command("ping") & filters.private)
 async def ping_cmd(client, message: Message):
+    # Rate limit ping
+    if is_rate_limited(message.from_user.id, "ping", 3):
+        return
+
     start_t = time.time()
     rm = await message.reply_text(
         "🔄 <b>Checking...</b>", parse_mode=ParseMode.HTML
@@ -2682,7 +2983,7 @@ async def noop_cb(client, query: CallbackQuery):
 
 
 # =====================================================
-# ⌨️ MASTER INPUT HANDLER
+# ⌨️ MASTER INPUT HANDLER — FIXED OTP & PHONE
 # =====================================================
 ADMIN_COMMANDS = [
     "start", "cancel", "reset", "ping", "help", "myid", "referral",
@@ -2713,23 +3014,38 @@ async def master_handler(client, message: Message):
     step = user_state[u_id].get("step")
     text = message.text.strip() if message.text else ""
 
-    # ── PHONE NUMBER ──────────────────────────────
+    # ── PHONE NUMBER — Fixed with normalization ───
+       # ── PHONE NUMBER — BULLETPROOF ────────────────
     if step == "wait_phone":
-        if not text.startswith("+") or len(text) < 7:
+        # Get raw text safely
+        raw_text = ""
+        if message.text:
+            raw_text = message.text
+        elif message.caption:
+            raw_text = message.caption
+
+        raw_text = raw_text.strip()
+
+        if not raw_text:
             return await message.reply_text(
-                "❌ Invalid format.\n"
-                "Send with country code: <code>+919876543210</code>",
+                "❌ Please send your phone number as text.",
                 parse_mode=ParseMode.HTML
             )
+
+        # Normalize phone number
+        phone, error = normalize_phone_number(raw_text)
+        if error:
+            return await message.reply_text(error, parse_mode=ParseMode.HTML)
 
         # Check if already logged in with this phone
         existing = get_user_accounts(u_id)
         for acc in existing.values():
-            if acc.get("phone") == text:
+            if acc.get("phone") == phone:
                 if u_id in user_state:
                     del user_state[u_id]
                 return await message.reply_text(
-                    "⚠️ This phone is already linked!",
+                    f"⚠️ <b>This phone is already linked!</b>\n"
+                    f"📱 <tg-spoiler>{phone}</tg-spoiler>",
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton(
                             "👥 Accounts", callback_data="accounts_menu"
@@ -2739,8 +3055,9 @@ async def master_handler(client, message: Message):
                 )
 
         w_msg = await message.reply_text(
-            "💀 <b>Connecting to Telegram...</b>\n"
-            "⏳ Please wait...",
+            f"💀 <b>Connecting to Telegram...</b>\n"
+            f"📱 Number: <tg-spoiler>{phone}</tg-spoiler>\n"
+            f"⏳ Sending OTP...",
             parse_mode=ParseMode.HTML
         )
 
@@ -2753,25 +3070,36 @@ async def master_handler(client, message: Message):
 
         try:
             await tc.connect()
-            code = await tc.send_code(text)
+            code = await tc.send_code(phone)
+
             user_state[u_id] = {
                 "step": "wait_otp",
-                "phone": text,
+                "phone": phone,
                 "hash": code.phone_code_hash,
-                "client": tc
+                "client": tc,
+                "_created": time.time()
             }
+
+            logger.info(f"OTP sent successfully to {u_id} for {phone}")
+
             await w_msg.edit_text(
-                "💀 <b>OTP Sent Successfully!</b>\n\n"
+                "💀 <b>OTP Sent! ✅</b>\n\n"
                 "┌─────────────────────\n"
                 "│ 📩 Check your Telegram app.\n"
-                "│ Enter OTP with spaces:\n"
                 "│\n"
-                "│ <b>Example:</b> <code>1 2 3 4 5</code>\n"
+                "│ <b>Just type the OTP normally:</b>\n"
                 "│\n"
+                "│ ✅ <code>12345</code> — works!\n"
+                "│ ✅ <code>1 2 3 4 5</code> — works!\n"
+                "│ ✅ <code>1-2-3-4-5</code> — works!\n"
+                "│ ✅ <code>12 345</code> — works!\n"
+                "│\n"
+                "│ 💡 Bot auto-detects digits.\n"
                 "│ ⚠️ OTP expires in 2 minutes!\n"
                 "└─────────────────────",
                 parse_mode=ParseMode.HTML
             )
+
         except FloodWait as e:
             try:
                 await tc.disconnect()
@@ -2781,9 +3109,17 @@ async def master_handler(client, message: Message):
                 del user_state[u_id]
             await w_msg.edit_text(
                 f"💀 <b>Rate Limited!</b>\n\n"
-                f"Wait <code>{e.value}</code> seconds and try again.",
+                f"┌─────────────────────\n"
+                f"│ ⏳ Telegram says wait\n"
+                f"│ <code>{e.value}</code> seconds.\n"
+                f"│ Try again after that.\n"
+                f"└─────────────────────",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔁 Retry", callback_data="login_acc")]
+                ]),
                 parse_mode=ParseMode.HTML
             )
+
         except Exception as e:
             try:
                 await tc.disconnect()
@@ -2791,20 +3127,52 @@ async def master_handler(client, message: Message):
                 pass
             if u_id in user_state:
                 del user_state[u_id]
-            await w_msg.edit_text(
-                f"💀 <b>Connection Failed!</b>\n\n"
-                f"┌─────────────────────\n"
-                f"│ ❌ {sanitize_html(str(e)[:150])}\n"
-                f"└─────────────────────",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton(
-                        "🔁 Retry", callback_data="login_acc"
-                    )]
-                ]),
-                parse_mode=ParseMode.HTML
-            )
 
-    # ── OTP ───────────────────────────────────────
+            error_str = str(e)
+            logger.warning(f"Login send_code error for {u_id}: {error_str}")
+
+            # Handle specific errors
+            if "PHONE_NUMBER_INVALID" in error_str.upper():
+                await w_msg.edit_text(
+                    "💀 <b>Invalid Phone Number!</b>\n\n"
+                    "┌─────────────────────\n"
+                    "│ ❌ Telegram rejected this number.\n"
+                    "│ Make sure country code is correct.\n"
+                    "│\n"
+                    "│ <b>Examples:</b>\n"
+                    "│ • <code>+919876543210</code> (India)\n"
+                    "│ • <code>+12025551234</code> (US)\n"
+                    "│ • <code>+447911123456</code> (UK)\n"
+                    "└─────────────────────",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔁 Retry", callback_data="login_acc")]
+                    ]),
+                    parse_mode=ParseMode.HTML
+                )
+            elif "PHONE_NUMBER_BANNED" in error_str.upper():
+                await w_msg.edit_text(
+                    "💀 <b>Phone Number Banned!</b>\n\n"
+                    "┌─────────────────────\n"
+                    "│ 🚫 This number is banned by Telegram.\n"
+                    "│ Try a different number.\n"
+                    "└─────────────────────",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔁 Try Another", callback_data="login_acc")]
+                    ]),
+                    parse_mode=ParseMode.HTML
+                )
+            else:
+                await w_msg.edit_text(
+                    f"💀 <b>Connection Failed!</b>\n\n"
+                    f"┌─────────────────────\n"
+                    f"│ ❌ {sanitize_html(error_str[:150])}\n"
+                    f"└─────────────────────",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔁 Retry", callback_data="login_acc")]
+                    ]),
+                    parse_mode=ParseMode.HTML
+                )
+      # ── OTP — BULLETPROOF FIX ─────────────────────
     elif step == "wait_otp":
         tc = user_state[u_id].get("client")
         if not tc:
@@ -2819,23 +3187,61 @@ async def master_handler(client, message: Message):
                 ]),
                 parse_mode=ParseMode.HTML
             )
+
+        # Get raw text — handle None safely
+        raw_text = ""
+        if message.text:
+            raw_text = message.text
+        elif message.caption:
+            raw_text = message.caption
+
+        raw_text = raw_text.strip()
+
+        if not raw_text:
+            return await message.reply_text(
+                "❌ <b>Please type the OTP code.</b>\n\n"
+                "Example: <code>12345</code>",
+                parse_mode=ParseMode.HTML
+            )
+
+        # Normalize OTP — extracts digits from ANY format
+        otp, error = normalize_otp(raw_text)
+        if error:
+            return await message.reply_text(error, parse_mode=ParseMode.HTML)
+
+        # Show processing message
+        proc_msg = await message.reply_text(
+            "💀 <b>Verifying OTP...</b> ⏳",
+            parse_mode=ParseMode.HTML
+        )
+
         try:
-            otp = text.replace(" ", "").replace("-", "").strip()
-            if not otp.isdigit():
-                return await message.reply_text(
-                    "❌ OTP must be digits only!\n"
-                    "Example: <code>1 2 3 4 5</code>",
-                    parse_mode=ParseMode.HTML
-                )
+            phone = user_state[u_id].get("phone", "")
+            phone_hash = user_state[u_id].get("hash", "")
+
+            logger.info(f"OTP attempt for {u_id}: {len(otp)} digits")
+
             await tc.sign_in(
-                user_state[u_id]["phone"],
-                user_state[u_id]["hash"],
-                otp
+                phone_number=phone,
+                phone_code_hash=phone_hash,
+                phone_code=otp
             )
+
+            try:
+                await proc_msg.delete()
+            except Exception:
+                pass
+
             await finish_login(
-                message, tc, u_id, user_state[u_id]["phone"]
+                message, tc, u_id, phone
             )
+
         except SessionPasswordNeeded:
+            try:
+                await proc_msg.delete()
+            except Exception:
+                pass
+
             user_state[u_id]["step"] = "wait_pass"
             await message.reply_text(
                 "💀 <b>2FA Password Required!</b>\n\n"
@@ -2843,23 +3249,70 @@ async def master_handler(client, message: Message):
                 "│ 🔐 Your account has Two-Factor\n"
                 "│ Authentication enabled.\n"
                 "│\n"
-                "│ Send your 2FA password:\n"
+                "│ Send your 2FA password now:\n"
                 "└─────────────────────",
                 parse_mode=ParseMode.HTML
             )
+
         except Exception as e:
+            try:
+                await proc_msg.delete()
+            except Exception:
+                pass
+
+            error_str = str(e)
+            logger.warning(f"OTP sign_in error for {u_id}: {error_str}")
+
+            # Check if OTP expired
+            if "PHONE_CODE_EXPIRED" in error_str.upper():
+                try:
+                    await tc.disconnect()
+                except Exception:
+                    pass
+                if u_id in user_state:
+                    del user_state[u_id]
+                return await message.reply_text(
+                    "💀 <b>OTP Expired!</b>\n\n"
+                    "┌─────────────────────\n"
+                    "│ ⏰ The OTP has expired.\n"
+                    "│ Please start login again.\n"
+                    "└─────────────────────",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton(
+                            "🔁 Login Again", callback_data="login_acc"
+                        )]
+                    ]),
+                    parse_mode=ParseMode.HTML
+                )
+
+            # Check if OTP is wrong
+            if "PHONE_CODE_INVALID" in error_str.upper():
+                return await message.reply_text(
+                    "💀 <b>Wrong OTP!</b>\n\n"
+                    "┌─────────────────────\n"
+                    "│ ❌ The code you entered is wrong.\n"
+                    "│ Check your Telegram app and\n"
+                    "│ send the correct OTP.\n"
+                    "│\n"
+                    "│ Just type the digits:\n"
+                    "│ Example: <code>12345</code>\n"
+                    "└─────────────────────",
+                    parse_mode=ParseMode.HTML
+                )
+
+            # Other errors — cleanup and retry
             try:
                 await tc.disconnect()
             except Exception:
                 pass
             if u_id in user_state:
                 del user_state[u_id]
+
             await message.reply_text(
-                f"💀 <b>OTP Error!</b>\n\n"
+                f"💀 <b>Login Error!</b>\n\n"
                 f"┌─────────────────────\n"
-                f"│ ❌ {sanitize_html(str(e)[:150])}\n"
-                f"└─────────────────────\n\n"
-                f"Try again with /start",
+                f"│ ❌ {sanitize_html(error_str[:150])}\n"
+                f"└─────────────────────",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton(
                         "🔁 Retry", callback_data="login_acc"
@@ -2890,6 +3343,7 @@ async def master_handler(client, message: Message):
                 pass
             if u_id in user_state:
                 del user_state[u_id]
+            logger.warning(f"2FA check_password error for {u_id}: {e}")
             await message.reply_text(
                 f"💀 <b>Wrong Password!</b>\n\n"
                 f"┌─────────────────────\n"
@@ -3024,7 +3478,7 @@ async def master_handler(client, message: Message):
         d = user_state[u_id].get("delay", 10)
         i = user_state[u_id].get("interval", 600)
 
-        data = get_data()
+        data = await async_get_data()
         if str(u_id) not in data["campaigns"]:
             data["campaigns"][str(u_id)] = {"status": "IDLE"}
         data["campaigns"][str(u_id)].update({
@@ -3033,7 +3487,7 @@ async def master_handler(client, message: Message):
             "total_rounds": rounds_val,
             "current_round": 1
         })
-        update_data(data)
+        await async_update_data(data)
 
         if u_id in user_state:
             del user_state[u_id]
@@ -3066,14 +3520,12 @@ async def master_handler(client, message: Message):
             l = l.strip()
             if not l:
                 continue
-            # Clean up various formats
             l = l.replace("https://t.me/", "")
             l = l.replace("http://t.me/", "")
             l = l.replace("t.me/", "")
             l = l.replace("@", "")
-            # Handle joinchat links
             if l.startswith("+") or l.startswith("joinchat/"):
-                continue  # Skip invite links
+                continue
             if l:
                 links.append(l)
 
@@ -3084,17 +3536,16 @@ async def master_handler(client, message: Message):
                 parse_mode=ParseMode.HTML
             )
 
-        # Check plan limit
         plan_info = get_user_plan_info(u_id)
         max_targets = plan_info.get("max_targets", 50)
         if len(links) > max_targets and not is_admin(u_id):
             links = links[:max_targets]
 
-        data = get_data()
+        data = await async_get_data()
         if str(u_id) not in data["campaigns"]:
             data["campaigns"][str(u_id)] = {"status": "IDLE"}
         data["campaigns"][str(u_id)]["targets"] = links
-        update_data(data)
+        await async_update_data(data)
 
         if u_id in user_state:
             del user_state[u_id]
@@ -3137,11 +3588,11 @@ async def master_handler(client, message: Message):
                 parse_mode=ParseMode.HTML
             )
 
-        data = get_data()
+        data = await async_get_data()
         if str(u_id) not in data["campaigns"]:
             data["campaigns"][str(u_id)] = {"status": "IDLE"}
         data["campaigns"][str(u_id)]["ad_html"] = html_content
-        update_data(data)
+        await async_update_data(data)
 
         if u_id in user_state:
             del user_state[u_id]
@@ -3167,17 +3618,22 @@ async def master_handler(client, message: Message):
 
     # ── ADMIN: CONFIRM RESET DB ───────────────────
     elif step == "adm_confirm_reset":
+        if not is_admin(u_id):
+            if u_id in user_state:
+                del user_state[u_id]
+            return
+
         if text == "CONFIRM RESET":
             if u_id in user_state:
                 del user_state[u_id]
             current_data = get_data()
             emergency_file = f"emergency_backup_{int(time.time())}.json"
             try:
-                with open(emergency_file, "w") as f:
+                with open(emergency_file, "w", encoding="utf-8") as f:
                     json.dump(current_data, f, indent=2)
-            except Exception:
-                pass
-            update_data(DEFAULT_DATA.copy())
+            except Exception as be:
+                logger.warning(f"Emergency backup error: {be}")
+            await async_update_data(DEFAULT_DATA.copy())
             add_admin_log("RESET_DATABASE", u_id, "Full database reset")
             await message.reply_text(
                 f"💀 <b>DATABASE WIPED!</b>\n\n"
@@ -3197,6 +3653,11 @@ async def master_handler(client, message: Message):
 
     # ── ADMIN: SEARCH USER ────────────────────────
     elif step == "adm_search_user":
+        if not is_admin(u_id):
+            if u_id in user_state:
+                del user_state[u_id]
+            return
+
         if u_id in user_state:
             del user_state[u_id]
         data = get_data()
@@ -3238,6 +3699,11 @@ async def master_handler(client, message: Message):
 
     # ── ADMIN: ADD PREMIUM ────────────────────────
     elif step == "adm_add_premium":
+        if not is_admin(u_id):
+            if u_id in user_state:
+                del user_state[u_id]
+            return
+
         if u_id in user_state:
             del user_state[u_id]
         parts = text.split()
@@ -3255,13 +3721,13 @@ async def master_handler(client, message: Message):
                     "❌ Invalid plan. Use: basic | pro | elite",
                     parse_mode=ParseMode.HTML
                 )
-            data = get_data()
+            data = await async_get_data()
             data["premium_users"][str(target_id)] = {
                 "plan": plan_key,
                 "added_by": u_id,
                 "added_date": time.strftime('%Y-%m-%d %H:%M:%S')
             }
-            update_data(data)
+            await async_update_data(data)
             plan_info = PLANS[plan_key]
             add_admin_log(
                 "ADD_PREMIUM", u_id,
@@ -3292,15 +3758,20 @@ async def master_handler(client, message: Message):
 
     # ── ADMIN: REMOVE PREMIUM ─────────────────────
     elif step == "adm_remove_premium":
+        if not is_admin(u_id):
+            if u_id in user_state:
+                del user_state[u_id]
+            return
+
         if u_id in user_state:
             del user_state[u_id]
         try:
             target_id = str(int(text.strip()))
-            data = get_data()
+            data = await async_get_data()
             removed = target_id in data.get("premium_users", {})
             if removed:
                 del data["premium_users"][target_id]
-                update_data(data)
+                await async_update_data(data)
                 add_admin_log(
                     "REMOVE_PREMIUM", u_id, f"User {target_id}"
                 )
@@ -3309,7 +3780,7 @@ async def master_handler(client, message: Message):
                 f"🆔 ID: <code>{target_id}</code>",
                 parse_mode=ParseMode.HTML
             )
-        except Exception:
+        except ValueError:
             await message.reply_text(
                 "❌ Invalid ID.",
                 parse_mode=ParseMode.HTML
@@ -3317,18 +3788,23 @@ async def master_handler(client, message: Message):
 
     # ── ADMIN: SET GLOBAL FOOTER ──────────────────
     elif step == "adm_set_footer":
+        if not is_admin(u_id):
+            if u_id in user_state:
+                del user_state[u_id]
+            return
+
         if u_id in user_state:
             del user_state[u_id]
-        data = get_data()
+        data = await async_get_data()
         if text.lower() in ["none", "clear", "remove", "off"]:
             data["settings"]["global_ad_footer"] = ""
-            update_data(data)
+            await async_update_data(data)
             return await message.reply_text(
                 "✅ Global footer cleared!",
                 parse_mode=ParseMode.HTML
             )
         data["settings"]["global_ad_footer"] = text
-        update_data(data)
+        await async_update_data(data)
         add_admin_log("SET_FOOTER", u_id, truncate_text(text, 50))
         await message.reply_text(
             f"✅ <b>Global footer set!</b>\n\n"
@@ -3338,12 +3814,17 @@ async def master_handler(client, message: Message):
 
     # ── ADMIN: SET FORCE JOIN ─────────────────────
     elif step == "adm_set_forcejoin":
+        if not is_admin(u_id):
+            if u_id in user_state:
+                del user_state[u_id]
+            return
+
         if u_id in user_state:
             del user_state[u_id]
-        data = get_data()
+        data = await async_get_data()
         if text.lower() in ["none", "clear", "remove", "off"]:
             data["settings"]["force_join_channel"] = ""
-            update_data(data)
+            await async_update_data(data)
             return await message.reply_text(
                 "✅ Force join disabled!",
                 parse_mode=ParseMode.HTML
@@ -3352,7 +3833,7 @@ async def master_handler(client, message: Message):
         if not channel.startswith("@"):
             channel = f"@{channel}"
         data["settings"]["force_join_channel"] = channel
-        update_data(data)
+        await async_update_data(data)
         add_admin_log("SET_FORCEJOIN", u_id, channel)
         await message.reply_text(
             f"✅ <b>Force join set!</b>\n"
@@ -3362,6 +3843,11 @@ async def master_handler(client, message: Message):
 
     # ── ADMIN: BROADCAST MESSAGE TEXT ─────────────
     elif step == "adm_broadcast_text":
+        if not is_admin(u_id):
+            if u_id in user_state:
+                del user_state[u_id]
+            return
+
         if u_id in user_state:
             del user_state[u_id]
         data = get_data()
@@ -3378,13 +3864,25 @@ async def master_handler(client, message: Message):
                     parse_mode=ParseMode.HTML
                 )
                 s += 1
+            except FloodWait as e:
+                await asyncio.sleep(e.value + 1)
+                try:
+                    await bot.send_message(
+                        int(uid_str), text,
+                        parse_mode=ParseMode.HTML
+                    )
+                    s += 1
+                except Exception:
+                    f_count += 1
             except Exception:
                 f_count += 1
             await asyncio.sleep(0.05)
+
+        data = await async_get_data()
         data["settings"]["total_broadcasts"] = (
             data["settings"].get("total_broadcasts", 0) + 1
         )
-        update_data(data)
+        await async_update_data(data)
         add_admin_log(
             "BROADCAST", u_id,
             f"Sent: {s}, Failed: {f_count}"
@@ -3398,6 +3896,75 @@ async def master_handler(client, message: Message):
             parse_mode=ParseMode.HTML
         )
 
+    # ── ADMIN: PREMIUM BROADCAST TEXT ─────────────
+    elif step == "adm_broadcast_premium_text":
+        if not is_admin(u_id):
+            if u_id in user_state:
+                del user_state[u_id]
+            return
+
+        if u_id in user_state:
+            del user_state[u_id]
+        data = get_data()
+        premium_ids = list(data.get("premium_users", {}).keys())
+
+        if not premium_ids:
+            return await message.reply_text(
+                "❌ No premium users to broadcast to!",
+                parse_mode=ParseMode.HTML
+            )
+
+        msg = await message.reply_text(
+            f"📢 <b>Premium Broadcast...</b>\n"
+            f"Target: <code>{len(premium_ids)}</code> premium users",
+            parse_mode=ParseMode.HTML
+        )
+
+        s, f_count = 0, 0
+        for uid_str in premium_ids:
+            try:
+                await bot.send_message(
+                    int(uid_str), text,
+                    parse_mode=ParseMode.HTML
+                )
+                s += 1
+            except FloodWait as e:
+                await asyncio.sleep(e.value + 1)
+                try:
+                    await bot.send_message(
+                        int(uid_str), text,
+                        parse_mode=ParseMode.HTML
+                    )
+                    s += 1
+                except Exception:
+                    f_count += 1
+            except Exception:
+                f_count += 1
+            await asyncio.sleep(0.05)
+
+        data = await async_get_data()
+        data["settings"]["total_broadcasts"] = (
+            data["settings"].get("total_broadcasts", 0) + 1
+        )
+        await async_update_data(data)
+        add_admin_log(
+            "PREMIUM_BROADCAST", u_id,
+            f"Sent: {s}, Failed: {f_count}"
+        )
+
+        await msg.edit_text(
+            f"💀 <b>Premium Broadcast Done!</b>\n\n"
+            f"┌─────────────────────\n"
+            f"│ ✅ Sent: <code>{s}</code>\n"
+            f"│ ❌ Failed: <code>{f_count}</code>\n"
+            f"└─────────────────────",
+            parse_mode=ParseMode.HTML
+        )
+
+
+# =====================================================
+# 📊 SYSTEM STATS HELPER
+# =====================================================
 def get_system_stats() -> dict:
     """Get comprehensive system statistics."""
     data = get_data()
@@ -3433,14 +4000,12 @@ def get_system_stats() -> dict:
     if os.path.exists(DATA_FILE):
         file_size = os.path.getsize(DATA_FILE)
 
-    # Calculate plan distribution
     plan_dist = {"free": 0, "basic": 0, "pro": 0, "elite": 0}
     for uid_str in data.get("users", {}):
         pk = get_user_plan_key(int(uid_str)) if uid_str.isdigit() else "free"
         if pk in plan_dist:
             plan_dist[pk] += 1
 
-    # Users active in last 24h
     active_24h = 0
     now = time.time()
     for u in data.get("users", {}).values():
@@ -3485,8 +4050,6 @@ def get_system_stats() -> dict:
         ),
         "admin_log_count": len(data.get("admin_logs", []))
     }
-
-
 # =====================================================
 # 👑 ADMIN PANEL — MAIN COMMAND
 # =====================================================
@@ -3611,6 +4174,8 @@ async def send_admin_panel(msg_or_query, is_edit: bool = False):
 async def adm_refresh_panel_cb(client, query: CallbackQuery):
     if not is_admin(query.from_user.id):
         return await query.answer("❌ Admin only!", show_alert=True)
+    if is_rate_limited(query.from_user.id, "adm_refresh", 2):
+        return await query.answer("⏳ Wait...", show_alert=False)
     await send_admin_panel(query.message, is_edit=True)
     await query.answer("✅ Refreshed!", show_alert=False)
 
@@ -3620,6 +4185,9 @@ async def adm_refresh_panel_cb(client, query: CallbackQuery):
 async def adm_back_panel_cb(client, query: CallbackQuery):
     if not is_admin(query.from_user.id):
         return await query.answer("❌ Admin only!", show_alert=True)
+    # Clear any admin state
+    if query.from_user.id in user_state:
+        del user_state[query.from_user.id]
     await send_admin_panel(query.message, is_edit=True)
 
 
@@ -3635,11 +4203,8 @@ async def adm_users_cb(client, query: CallbackQuery):
     banned_count = len(data.get("banned_users", []))
     premium_count = len(data.get("premium_users", {}))
 
-    # Recent users (last 10)
     sorted_users = sorted(
-        users,
-        key=lambda x: x.get("joined_date", ""),
-        reverse=True
+        users, key=lambda x: x.get("joined_date", ""), reverse=True
     )
 
     text = (
@@ -3742,7 +4307,6 @@ async def adm_user_stats_cb(client, query: CallbackQuery):
     data = get_data()
     stats = data.get("stats", {})
 
-    # Top senders
     top_senders = sorted(
         stats.items(),
         key=lambda x: x[1].get("total_sent", 0),
@@ -3785,19 +4349,24 @@ async def adm_export_users_cb(client, query: CallbackQuery):
         banned = "YES" if int(uid_str) in data.get("banned_users", []) else "NO"
         lines.append(f"{uid},{name},{uname},{joined},{plan},{banned}")
 
-    export_file = "users_export.csv"
-    with open(export_file, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
-
+    export_file = f"users_export_{int(time.time())}.csv"
     try:
+        with open(export_file, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
         await query.message.reply_document(
             document=export_file,
             caption=f"💀 <b>User Export</b>\n{len(lines) - 1} users",
             parse_mode=ParseMode.HTML
         )
-        os.remove(export_file)
     except Exception as e:
+        logger.error(f"Export error: {e}")
         await query.answer(f"Error: {str(e)[:100]}", show_alert=True)
+    finally:
+        if os.path.exists(export_file):
+            try:
+                os.remove(export_file)
+            except Exception:
+                pass
 
 
 # ── Premium Section ───────────────────────────────────
@@ -3841,7 +4410,7 @@ async def adm_premium_cb(client, query: CallbackQuery):
 async def adm_add_premium_btn_cb(client, query: CallbackQuery):
     if not is_admin(query.from_user.id):
         return await query.answer("❌ Admin only!", show_alert=True)
-    user_state[query.from_user.id] = {"step": "adm_add_premium"}
+    user_state[query.from_user.id] = {"step": "adm_add_premium", "_created": time.time()}
     await safe_edit(
         query.message,
         "💀 <b>Add Premium</b>\n\n"
@@ -3858,7 +4427,7 @@ async def adm_add_premium_btn_cb(client, query: CallbackQuery):
 async def adm_remove_premium_btn_cb(client, query: CallbackQuery):
     if not is_admin(query.from_user.id):
         return await query.answer("❌ Admin only!", show_alert=True)
-    user_state[query.from_user.id] = {"step": "adm_remove_premium"}
+    user_state[query.from_user.id] = {"step": "adm_remove_premium", "_created": time.time()}
     await safe_edit(
         query.message,
         "💀 <b>Remove Premium</b>\n\n"
@@ -3922,7 +4491,7 @@ async def adm_campaigns_cb(client, query: CallbackQuery):
             InlineKeyboardButton("▶️ Resume All", callback_data="adm_resumeall_btn")
         ],
         [
-            InlineKeyboardButton("🗑️ Clear Completed", callback_data="adm_clear_completed"),
+            InlineKeyboardButton("🗑️ Clear Done", callback_data="adm_clear_completed"),
             InlineKeyboardButton("🔄 Reset All", callback_data="adm_reset_all_camps")
         ],
         [InlineKeyboardButton("🔙 Admin Panel", callback_data="adm_back_panel")]
@@ -3935,13 +4504,13 @@ async def adm_campaigns_cb(client, query: CallbackQuery):
 async def adm_pauseall_btn_cb(client, query: CallbackQuery):
     if not is_admin(query.from_user.id):
         return await query.answer("❌ Admin only!", show_alert=True)
-    data = get_data()
+    data = await async_get_data()
     count = 0
     for uid in data["campaigns"]:
         if data["campaigns"][uid].get("status") == "RUNNING":
             data["campaigns"][uid]["status"] = "PAUSED"
             count += 1
-    update_data(data)
+    await async_update_data(data)
     add_admin_log("PAUSE_ALL", query.from_user.id, f"{count} campaigns paused")
     await query.answer(f"⏸️ {count} campaigns paused!", show_alert=True)
     await adm_campaigns_cb(client, query)
@@ -3951,7 +4520,7 @@ async def adm_pauseall_btn_cb(client, query: CallbackQuery):
 async def adm_resumeall_btn_cb(client, query: CallbackQuery):
     if not is_admin(query.from_user.id):
         return await query.answer("❌ Admin only!", show_alert=True)
-    data = get_data()
+    data = await async_get_data()
     count = 0
     for uid in data["campaigns"]:
         camp = data["campaigns"][uid]
@@ -3960,7 +4529,7 @@ async def adm_resumeall_btn_cb(client, query: CallbackQuery):
                 camp.get("group_delay")):
             data["campaigns"][uid]["status"] = "RUNNING"
             count += 1
-    update_data(data)
+    await async_update_data(data)
     add_admin_log("RESUME_ALL", query.from_user.id, f"{count} campaigns resumed")
     await query.answer(f"▶️ {count} campaigns resumed!", show_alert=True)
     await adm_campaigns_cb(client, query)
@@ -3970,14 +4539,14 @@ async def adm_resumeall_btn_cb(client, query: CallbackQuery):
 async def adm_clear_completed_cb(client, query: CallbackQuery):
     if not is_admin(query.from_user.id):
         return await query.answer("❌ Admin only!", show_alert=True)
-    data = get_data()
+    data = await async_get_data()
     count = 0
     for uid in list(data["campaigns"].keys()):
         if data["campaigns"][uid].get("status") == "COMPLETED":
             data["campaigns"][uid]["status"] = "IDLE"
             data["campaigns"][uid]["current_round"] = 1
             count += 1
-    update_data(data)
+    await async_update_data(data)
     await query.answer(f"🗑️ {count} completed campaigns cleared!", show_alert=True)
     await adm_campaigns_cb(client, query)
 
@@ -3986,13 +4555,13 @@ async def adm_clear_completed_cb(client, query: CallbackQuery):
 async def adm_reset_all_camps_cb(client, query: CallbackQuery):
     if not is_admin(query.from_user.id):
         return await query.answer("❌ Admin only!", show_alert=True)
-    data = get_data()
+    data = await async_get_data()
     count = 0
     for uid in data["campaigns"]:
         data["campaigns"][uid]["status"] = "IDLE"
         data["campaigns"][uid]["current_round"] = 1
         count += 1
-    update_data(data)
+    await async_update_data(data)
     add_admin_log("RESET_ALL_CAMPAIGNS", query.from_user.id, f"{count} reset")
     await query.answer(f"🔄 {count} campaigns reset!", show_alert=True)
     await adm_campaigns_cb(client, query)
@@ -4049,6 +4618,7 @@ async def adm_validate_sessions_cb(client, query: CallbackQuery):
     invalid_keys = []
 
     for acc_key, acc in list(accounts.items()):
+        tc = None
         try:
             tc = Client(
                 f"validate_{acc_key[:10]}_{int(time.time())}",
@@ -4059,19 +4629,25 @@ async def adm_validate_sessions_cb(client, query: CallbackQuery):
             )
             await tc.connect()
             await tc.get_me()
-            await tc.disconnect()
             valid += 1
         except AuthKeyUnregistered:
             invalid += 1
             invalid_keys.append(acc_key)
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Session validation error for {acc_key}: {e}")
             invalid += 1
             invalid_keys.append(acc_key)
+        finally:
+            if tc:
+                try:
+                    await tc.disconnect()
+                except Exception:
+                    pass
 
     # Store invalid keys for clearing
-    data = get_data()
+    data = await async_get_data()
     data["settings"]["_invalid_sessions"] = invalid_keys
-    update_data(data)
+    await async_update_data(data)
 
     await safe_send(
         query.from_user.id,
@@ -4088,7 +4664,7 @@ async def adm_clear_invalid_cb(client, query: CallbackQuery):
     if not is_admin(query.from_user.id):
         return await query.answer("❌ Admin only!", show_alert=True)
 
-    data = get_data()
+    data = await async_get_data()
     invalid_keys = data.get("settings", {}).get("_invalid_sessions", [])
 
     if not invalid_keys:
@@ -4099,7 +4675,6 @@ async def adm_clear_invalid_cb(client, query: CallbackQuery):
         if key in data["accounts"]:
             uid = data["accounts"][key].get("user_id")
             del data["accounts"][key]
-            # Update active account
             if uid:
                 active = data.get("active_account", {}).get(str(uid))
                 if active == key:
@@ -4111,10 +4686,13 @@ async def adm_clear_invalid_cb(client, query: CallbackQuery):
                         data["active_account"][str(uid)] = list(remaining.keys())[0]
                     else:
                         data.get("active_account", {}).pop(str(uid), None)
+                        # Pause campaign if no accounts left
+                        if data.get("campaigns", {}).get(str(uid), {}).get("status") == "RUNNING":
+                            data["campaigns"][str(uid)]["status"] = "PAUSED"
             count += 1
 
     data["settings"].pop("_invalid_sessions", None)
-    update_data(data)
+    await async_update_data(data)
     add_admin_log("CLEAR_INVALID_SESSIONS", query.from_user.id, f"{count} removed")
     await query.answer(f"🗑️ {count} invalid sessions removed!", show_alert=True)
     await adm_sessions_cb(client, query)
@@ -4160,7 +4738,7 @@ async def adm_broadcast_menu_cb(client, query: CallbackQuery):
 async def adm_broadcast_text_btn_cb(client, query: CallbackQuery):
     if not is_admin(query.from_user.id):
         return await query.answer("❌ Admin only!", show_alert=True)
-    user_state[query.from_user.id] = {"step": "adm_broadcast_text"}
+    user_state[query.from_user.id] = {"step": "adm_broadcast_text", "_created": time.time()}
     await safe_edit(
         query.message,
         "💀 <b>Type Broadcast Message</b>\n\n"
@@ -4177,7 +4755,7 @@ async def adm_broadcast_text_btn_cb(client, query: CallbackQuery):
 async def adm_broadcast_premium_btn_cb(client, query: CallbackQuery):
     if not is_admin(query.from_user.id):
         return await query.answer("❌ Admin only!", show_alert=True)
-    user_state[query.from_user.id] = {"step": "adm_broadcast_premium_text"}
+    user_state[query.from_user.id] = {"step": "adm_broadcast_premium_text", "_created": time.time()}
     await safe_edit(
         query.message,
         "💀 <b>Premium Broadcast</b>\n\n"
@@ -4245,6 +4823,8 @@ async def adm_db_menu_cb(client, query: CallbackQuery):
 async def adm_download_db_cb(client, query: CallbackQuery):
     if not is_admin(query.from_user.id):
         return await query.answer("❌ Admin only!", show_alert=True)
+
+    backup_file = f"skull_backup_{int(time.time())}.json"
     try:
         data = get_data()
         backup = {
@@ -4256,7 +4836,6 @@ async def adm_download_db_cb(client, query: CallbackQuery):
             },
             "data": data
         }
-        backup_file = f"skull_backup_{int(time.time())}.json"
         with open(backup_file, "w", encoding="utf-8") as f:
             json.dump(backup, f, indent=2, ensure_ascii=False)
         file_size = get_readable_size(os.path.getsize(backup_file))
@@ -4273,10 +4852,16 @@ async def adm_download_db_cb(client, query: CallbackQuery):
             ),
             parse_mode=ParseMode.HTML
         )
-        os.remove(backup_file)
         add_admin_log("DOWNLOAD_DB", query.from_user.id)
     except Exception as e:
+        logger.error(f"DB download error: {e}")
         await query.answer(f"Error: {str(e)[:100]}", show_alert=True)
+    finally:
+        if os.path.exists(backup_file):
+            try:
+                os.remove(backup_file)
+            except Exception:
+                pass
 
 
 @bot.on_callback_query(filters.regex("^adm_upload_db_info$"))
@@ -4304,11 +4889,13 @@ async def adm_create_backup_cb(client, query: CallbackQuery):
         backup_name = f"manual_backup_{int(time.time())}.json"
         with open(backup_name, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
+        data = await async_get_data()
         data["settings"]["last_backup"] = time.strftime('%Y-%m-%d %H:%M:%S')
-        update_data(data)
+        await async_update_data(data)
         add_admin_log("CREATE_BACKUP", query.from_user.id, backup_name)
         await query.answer(f"✅ Backup created: {backup_name}", show_alert=True)
     except Exception as e:
+        logger.error(f"Backup creation error: {e}")
         await query.answer(f"Error: {str(e)[:100]}", show_alert=True)
 
 
@@ -4322,15 +4909,16 @@ async def adm_restore_backup_cb(client, query: CallbackQuery):
     try:
         with open(backup_file, "r", encoding="utf-8") as f:
             backup_data = json.load(f)
-        # Save current as emergency
         current = get_data()
-        with open(f"pre_restore_{int(time.time())}.json", "w") as f:
+        emergency = f"pre_restore_{int(time.time())}.json"
+        with open(emergency, "w", encoding="utf-8") as f:
             json.dump(current, f, indent=2)
-        update_data(backup_data)
-        add_admin_log("RESTORE_BACKUP", query.from_user.id)
+        await async_update_data(backup_data)
+        add_admin_log("RESTORE_BACKUP", query.from_user.id, f"Emergency: {emergency}")
         await query.answer("✅ Backup restored!", show_alert=True)
         await adm_db_menu_cb(client, query)
     except Exception as e:
+        logger.error(f"Restore error: {e}")
         await query.answer(f"Error: {str(e)[:100]}", show_alert=True)
 
 
@@ -4355,17 +4943,17 @@ async def adm_reset_db_confirm_cb(client, query: CallbackQuery):
             [InlineKeyboardButton("❌ CANCEL", callback_data="adm_db_menu")]
         ])
     )
-    user_state[query.from_user.id] = {"step": "adm_confirm_reset"}
+    user_state[query.from_user.id] = {"step": "adm_confirm_reset", "_created": time.time()}
 
 
 @bot.on_callback_query(filters.regex("^adm_clean_logs$"))
 async def adm_clean_logs_cb(client, query: CallbackQuery):
     if not is_admin(query.from_user.id):
         return await query.answer("❌ Admin only!", show_alert=True)
-    data = get_data()
+    data = await async_get_data()
     old_count = len(data.get("admin_logs", []))
     data["admin_logs"] = data.get("admin_logs", [])[:50]
-    update_data(data)
+    await async_update_data(data)
     cleaned = old_count - len(data["admin_logs"])
     await query.answer(f"🧹 Cleaned {cleaned} old log entries!", show_alert=True)
 
@@ -4417,9 +5005,9 @@ async def adm_settings_cb(client, query: CallbackQuery):
 async def adm_maintenance_on_cb(client, query: CallbackQuery):
     if not is_admin(query.from_user.id):
         return await query.answer("❌ Admin only!", show_alert=True)
-    data = get_data()
+    data = await async_get_data()
     data["settings"]["maintenance_mode"] = True
-    update_data(data)
+    await async_update_data(data)
     add_admin_log("MAINTENANCE_ON", query.from_user.id)
     await query.answer("🔴 Maintenance mode ENABLED!", show_alert=True)
     await adm_settings_cb(client, query)
@@ -4429,9 +5017,9 @@ async def adm_maintenance_on_cb(client, query: CallbackQuery):
 async def adm_maintenance_off_cb(client, query: CallbackQuery):
     if not is_admin(query.from_user.id):
         return await query.answer("❌ Admin only!", show_alert=True)
-    data = get_data()
+    data = await async_get_data()
     data["settings"]["maintenance_mode"] = False
-    update_data(data)
+    await async_update_data(data)
     add_admin_log("MAINTENANCE_OFF", query.from_user.id)
     await query.answer("🟢 Maintenance mode DISABLED!", show_alert=True)
     await adm_settings_cb(client, query)
@@ -4441,7 +5029,7 @@ async def adm_maintenance_off_cb(client, query: CallbackQuery):
 async def adm_set_forcejoin_btn_cb(client, query: CallbackQuery):
     if not is_admin(query.from_user.id):
         return await query.answer("❌ Admin only!", show_alert=True)
-    user_state[query.from_user.id] = {"step": "adm_set_forcejoin"}
+    user_state[query.from_user.id] = {"step": "adm_set_forcejoin", "_created": time.time()}
     await safe_edit(
         query.message,
         "💀 <b>Set Force Join Channel</b>\n\n"
@@ -4458,7 +5046,7 @@ async def adm_set_forcejoin_btn_cb(client, query: CallbackQuery):
 async def adm_set_footer_btn_cb(client, query: CallbackQuery):
     if not is_admin(query.from_user.id):
         return await query.answer("❌ Admin only!", show_alert=True)
-    user_state[query.from_user.id] = {"step": "adm_set_footer"}
+    user_state[query.from_user.id] = {"step": "adm_set_footer", "_created": time.time()}
     await safe_edit(
         query.message,
         "💀 <b>Set Global Ad Footer</b>\n\n"
@@ -4475,9 +5063,9 @@ async def adm_set_footer_btn_cb(client, query: CallbackQuery):
 async def adm_clear_footer_cb(client, query: CallbackQuery):
     if not is_admin(query.from_user.id):
         return await query.answer("❌ Admin only!", show_alert=True)
-    data = get_data()
+    data = await async_get_data()
     data["settings"]["global_ad_footer"] = ""
-    update_data(data)
+    await async_update_data(data)
     add_admin_log("CLEAR_FOOTER", query.from_user.id)
     await query.answer("✅ Global footer cleared!", show_alert=True)
     await adm_settings_cb(client, query)
@@ -4487,9 +5075,9 @@ async def adm_clear_footer_cb(client, query: CallbackQuery):
 async def adm_clear_forcejoin_cb(client, query: CallbackQuery):
     if not is_admin(query.from_user.id):
         return await query.answer("❌ Admin only!", show_alert=True)
-    data = get_data()
+    data = await async_get_data()
     data["settings"]["force_join_channel"] = ""
-    update_data(data)
+    await async_update_data(data)
     add_admin_log("CLEAR_FORCEJOIN", query.from_user.id)
     await query.answer("✅ Force join disabled!", show_alert=True)
     await adm_settings_cb(client, query)
@@ -4504,23 +5092,17 @@ async def adm_analytics_cb(client, query: CallbackQuery):
     s = get_system_stats()
     data = get_data()
 
-    # Calculate rates
     total_ops = s["total_sent"] + s["total_failed"]
     success_rate = round((s["total_sent"] / total_ops * 100), 1) if total_ops > 0 else 0
 
-    # Average per user
     users_with_stats = len(data.get("stats", {}))
     avg_sent = round(s["total_sent"] / max(users_with_stats, 1))
 
-    # Growth metrics
     total_users = s["total_users"]
     active = s["active_24h"]
     active_pct = round((active / max(total_users, 1)) * 100, 1)
 
-    # Session health
-    login_logout_ratio = round(
-        s["logins"] / max(s["logouts"], 1), 2
-    )
+    login_logout_ratio = round(s["logins"] / max(s["logouts"], 1), 2)
 
     text = (
         f"💀 <b>Admin — Analytics Dashboard</b>\n\n"
@@ -4597,10 +5179,10 @@ async def adm_banned_list_cb(client, query: CallbackQuery):
 async def adm_unban_all_cb(client, query: CallbackQuery):
     if not is_admin(query.from_user.id):
         return await query.answer("❌ Admin only!", show_alert=True)
-    data = get_data()
+    data = await async_get_data()
     count = len(data.get("banned_users", []))
     data["banned_users"] = []
-    update_data(data)
+    await async_update_data(data)
     add_admin_log("UNBAN_ALL", query.from_user.id, f"{count} users unbanned")
     await query.answer(f"✅ {count} users unbanned!", show_alert=True)
     await adm_banned_list_cb(client, query)
@@ -4622,7 +5204,6 @@ async def adm_logs_cb(client, query: CallbackQuery):
     else:
         for log in logs[:15]:
             action = log.get("action", "?")
-            admin = log.get("admin_id", "?")
             ts = log.get("timestamp", "?")[:16]
             details = truncate_text(log.get("details", ""), 25)
             detail_str = f" • {details}" if details else ""
@@ -4647,10 +5228,10 @@ async def adm_logs_cb(client, query: CallbackQuery):
 async def adm_clear_all_logs_cb(client, query: CallbackQuery):
     if not is_admin(query.from_user.id):
         return await query.answer("❌ Admin only!", show_alert=True)
-    data = get_data()
+    data = await async_get_data()
     count = len(data.get("admin_logs", []))
     data["admin_logs"] = []
-    update_data(data)
+    await async_update_data(data)
     await query.answer(f"🗑️ {count} logs cleared!", show_alert=True)
     await adm_logs_cb(client, query)
 
@@ -4664,17 +5245,23 @@ async def adm_export_logs_cb(client, query: CallbackQuery):
     if not logs:
         return await query.answer("No logs to export!", show_alert=True)
     log_file = f"admin_logs_{int(time.time())}.json"
-    with open(log_file, "w", encoding="utf-8") as f:
-        json.dump(logs, f, indent=2)
     try:
+        with open(log_file, "w", encoding="utf-8") as f:
+            json.dump(logs, f, indent=2)
         await query.message.reply_document(
             document=log_file,
             caption=f"💀 Admin Logs — {len(logs)} entries",
             parse_mode=ParseMode.HTML
         )
-        os.remove(log_file)
     except Exception as e:
+        logger.error(f"Log export error: {e}")
         await query.answer(f"Error: {str(e)[:50]}", show_alert=True)
+    finally:
+        if os.path.exists(log_file):
+            try:
+                os.remove(log_file)
+            except Exception:
+                pass
 
 
 # ── Search User ───────────────────────────────────────
@@ -4682,7 +5269,7 @@ async def adm_export_logs_cb(client, query: CallbackQuery):
 async def adm_search_cb(client, query: CallbackQuery):
     if not is_admin(query.from_user.id):
         return await query.answer("❌ Admin only!", show_alert=True)
-    user_state[query.from_user.id] = {"step": "adm_search_user"}
+    user_state[query.from_user.id] = {"step": "adm_search_user", "_created": time.time()}
     await safe_edit(
         query.message,
         "💀 <b>Search Users</b>\n\n"
@@ -4715,14 +5302,13 @@ async def ban_cmd(client, message: Message):
             return await message.reply_text(
                 "❌ Cannot ban an admin!", parse_mode=ParseMode.HTML
             )
-        data = get_data()
+        data = await async_get_data()
         if ban_id not in data["banned_users"]:
             data["banned_users"].append(ban_id)
-        # Pause their campaign
         if str(ban_id) in data["campaigns"]:
             data["campaigns"][str(ban_id)]["status"] = "PAUSED"
         data["settings"]["total_bans"] = data["settings"].get("total_bans", 0) + 1
-        update_data(data)
+        await async_update_data(data)
         add_admin_log("BAN_USER", message.from_user.id, f"Banned {ban_id}")
 
         user = data["users"].get(str(ban_id), {})
@@ -4735,11 +5321,7 @@ async def ban_cmd(client, message: Message):
             f"└─────────────────────",
             parse_mode=ParseMode.HTML
         )
-        await safe_send(
-            ban_id,
-            "💀 <b>You have been banned from Skull Ads Bot.</b>\n\n"
-            "Contact @skullmodder for support."
-        )
+        await safe_send(ban_id, "💀 <b>You have been banned from Skull Ads Bot.</b>\nContact @skullmodder for support.")
     except ValueError:
         await message.reply_text("❌ Invalid ID.", parse_mode=ParseMode.HTML)
 
@@ -4750,28 +5332,23 @@ async def unban_cmd(client, message: Message):
         return
     if len(message.command) < 2:
         return await message.reply_text(
-            "💀 <b>Usage:</b> <code>/unban [user_id]</code>",
-            parse_mode=ParseMode.HTML
+            "💀 <b>Usage:</b> <code>/unban [user_id]</code>", parse_mode=ParseMode.HTML
         )
     try:
         unban_id = int(message.command[1])
-        data = get_data()
+        data = await async_get_data()
         was_banned = unban_id in data["banned_users"]
         if was_banned:
             data["banned_users"].remove(unban_id)
         data["settings"]["total_unbans"] = data["settings"].get("total_unbans", 0) + 1
-        update_data(data)
+        await async_update_data(data)
         add_admin_log("UNBAN_USER", message.from_user.id, f"Unbanned {unban_id}")
         await message.reply_text(
             f"💀 <b>User {'Unbanned' if was_banned else 'Was Not Banned'}!</b>\n"
-            f"🆔 ID: <code>{unban_id}</code>",
-            parse_mode=ParseMode.HTML
+            f"🆔 ID: <code>{unban_id}</code>", parse_mode=ParseMode.HTML
         )
         if was_banned:
-            await safe_send(
-                unban_id,
-                "💀 <b>You have been unbanned!</b>\nWelcome back. 🎉"
-            )
+            await safe_send(unban_id, "💀 <b>You have been unbanned!</b>\nWelcome back. 🎉")
     except ValueError:
         await message.reply_text("❌ Invalid ID.", parse_mode=ParseMode.HTML)
 
@@ -4782,20 +5359,15 @@ async def maintenance_cmd(client, message: Message):
         return
     if len(message.command) < 2:
         return await message.reply_text(
-            "💀 <b>Usage:</b> <code>/maintenance on</code> or <code>off</code>",
-            parse_mode=ParseMode.HTML
+            "💀 <b>Usage:</b> <code>/maintenance on</code> or <code>off</code>", parse_mode=ParseMode.HTML
         )
     st = message.command[1].lower() in ['on', 'true', '1', 'yes']
-    data = get_data()
+    data = await async_get_data()
     data["settings"]["maintenance_mode"] = st
-    update_data(data)
-    add_admin_log(
-        f"MAINTENANCE_{'ON' if st else 'OFF'}",
-        message.from_user.id
-    )
+    await async_update_data(data)
+    add_admin_log(f"MAINTENANCE_{'ON' if st else 'OFF'}", message.from_user.id)
     await message.reply_text(
-        f"💀 <b>Maintenance: {'🔴 ON' if st else '🟢 OFF'}</b>",
-        parse_mode=ParseMode.HTML
+        f"💀 <b>Maintenance: {'🔴 ON' if st else '🟢 OFF'}</b>", parse_mode=ParseMode.HTML
     )
 
 
@@ -4803,20 +5375,16 @@ async def maintenance_cmd(client, message: Message):
 async def pauseall_cmd(client, message: Message):
     if not is_admin(message.from_user.id):
         return
-    data = get_data()
+    data = await async_get_data()
     count = 0
     for uid in data["campaigns"]:
         if data["campaigns"][uid].get("status") == "RUNNING":
             data["campaigns"][uid]["status"] = "PAUSED"
             count += 1
-    update_data(data)
+    await async_update_data(data)
     add_admin_log("PAUSE_ALL", message.from_user.id, f"{count} paused")
     await message.reply_text(
-        f"💀 <b>Emergency Stop!</b>\n\n"
-        f"┌─────────────────────\n"
-        f"│ 🛑 {count} campaigns paused.\n"
-        f"└─────────────────────",
-        parse_mode=ParseMode.HTML
+        f"💀 <b>Emergency Stop!</b>\n│ 🛑 {count} campaigns paused.", parse_mode=ParseMode.HTML
     )
 
 
@@ -4824,23 +5392,18 @@ async def pauseall_cmd(client, message: Message):
 async def resumeall_cmd(client, message: Message):
     if not is_admin(message.from_user.id):
         return
-    data = get_data()
+    data = await async_get_data()
     count = 0
     for uid in data["campaigns"]:
         camp = data["campaigns"][uid]
-        if (camp.get("status") == "PAUSED" and
-                camp.get("targets") and camp.get("ad_html") and
-                camp.get("group_delay")):
+        if (camp.get("status") == "PAUSED" and camp.get("targets") and
+                camp.get("ad_html") and camp.get("group_delay")):
             data["campaigns"][uid]["status"] = "RUNNING"
             count += 1
-    update_data(data)
+    await async_update_data(data)
     add_admin_log("RESUME_ALL", message.from_user.id, f"{count} resumed")
     await message.reply_text(
-        f"💀 <b>Master Resume!</b>\n\n"
-        f"┌─────────────────────\n"
-        f"│ 🚀 {count} campaigns resumed.\n"
-        f"└─────────────────────",
-        parse_mode=ParseMode.HTML
+        f"💀 <b>Master Resume!</b>\n│ 🚀 {count} campaigns resumed.", parse_mode=ParseMode.HTML
     )
 
 
@@ -4850,49 +5413,28 @@ async def addpremium_cmd(client, message: Message):
         return
     if len(message.command) < 3:
         return await message.reply_text(
-            "💀 <b>Usage:</b> <code>/addpremium [user_id] [plan]</code>\n\n"
-            "<b>Plans:</b> basic | pro | elite",
-            parse_mode=ParseMode.HTML
+            "💀 <b>Usage:</b> <code>/addpremium [user_id] [plan]</code>\n"
+            "<b>Plans:</b> basic | pro | elite", parse_mode=ParseMode.HTML
         )
     try:
         target_id = int(message.command[1])
         plan_key = message.command[2].lower()
         if plan_key not in PLANS or plan_key == "free":
-            return await message.reply_text(
-                "❌ Invalid plan. Use: <code>basic</code> | <code>pro</code> | <code>elite</code>",
-                parse_mode=ParseMode.HTML
-            )
-        data = get_data()
+            return await message.reply_text("❌ Invalid plan. Use: basic | pro | elite", parse_mode=ParseMode.HTML)
+        data = await async_get_data()
         data["premium_users"][str(target_id)] = {
-            "plan": plan_key,
-            "added_by": message.from_user.id,
+            "plan": plan_key, "added_by": message.from_user.id,
             "added_date": time.strftime('%Y-%m-%d %H:%M:%S')
         }
-        update_data(data)
+        await async_update_data(data)
         plan_info = PLANS[plan_key]
         add_admin_log("ADD_PREMIUM", message.from_user.id, f"{target_id} → {plan_key}")
         await message.reply_text(
-            f"💀 <b>Premium Granted!</b>\n\n"
-            f"┌─────────────────────\n"
-            f"│ 🆔 ID: <code>{target_id}</code>\n"
-            f"│ 💎 Plan: {plan_info['name']}\n"
-            f"│ 👥 Slots: <code>{plan_info['accounts']}</code>\n"
-            f"│ 🎯 Targets: <code>{plan_info['max_targets']}</code>\n"
-            f"│ 🔄 Rounds: <code>{plan_info['max_rounds']}</code>\n"
-            f"└─────────────────────",
+            f"💀 <b>Premium Granted!</b>\n│ 🆔 {target_id} → {plan_info['name']}\n│ 👥 Slots: {plan_info['accounts']}",
             parse_mode=ParseMode.HTML
         )
-        await safe_send(
-            target_id,
-            f"💀 <b>Premium Activated!</b>\n\n"
-            f"┌─────────────────────\n"
-            f"│ 🎉 Plan: {plan_info['name']}\n"
-            f"│ 👥 Account Slots: <code>{plan_info['accounts']}</code>\n"
-            f"│ 🎯 Max Targets: <code>{plan_info['max_targets']}</code>\n"
-            f"│ 🔄 Max Rounds: <code>{plan_info['max_rounds']}</code>\n"
-            f"└─────────────────────\n\n"
-            f"Thank you! @skullmodder"
-        )
+        await safe_send(target_id,
+            f"💀 <b>Premium Activated!</b>\n│ 🎉 Plan: {plan_info['name']}\n│ 👥 Slots: {plan_info['accounts']}")
     except ValueError:
         await message.reply_text("❌ Invalid user ID.", parse_mode=ParseMode.HTML)
 
@@ -4902,29 +5444,20 @@ async def removepremium_cmd(client, message: Message):
     if not is_admin(message.from_user.id):
         return
     if len(message.command) < 2:
-        return await message.reply_text(
-            "💀 <b>Usage:</b> <code>/removepremium [user_id]</code>",
-            parse_mode=ParseMode.HTML
-        )
+        return await message.reply_text("💀 <b>Usage:</b> <code>/removepremium [user_id]</code>", parse_mode=ParseMode.HTML)
     try:
         target_id = str(int(message.command[1]))
-        data = get_data()
+        data = await async_get_data()
         removed = target_id in data.get("premium_users", {})
         if removed:
             del data["premium_users"][target_id]
-            update_data(data)
+            await async_update_data(data)
             add_admin_log("REMOVE_PREMIUM", message.from_user.id, f"User {target_id}")
         await message.reply_text(
-            f"💀 <b>{'Premium Removed' if removed else 'Not Found'}!</b>\n"
-            f"🆔 ID: <code>{target_id}</code>",
-            parse_mode=ParseMode.HTML
-        )
+            f"💀 <b>{'Premium Removed' if removed else 'Not Found'}!</b>\n🆔 ID: <code>{target_id}</code>",
+            parse_mode=ParseMode.HTML)
         if removed:
-            await safe_send(
-                int(target_id),
-                "💀 <b>Your premium has been removed.</b>\n"
-                "Contact @skullmodder for renewal."
-            )
+            await safe_send(int(target_id), "💀 <b>Your premium has been removed.</b>\nContact @skullmodder for renewal.")
     except ValueError:
         await message.reply_text("❌ Invalid ID.", parse_mode=ParseMode.HTML)
 
@@ -4934,23 +5467,15 @@ async def userinfo_cmd(client, message: Message):
     if not is_admin(message.from_user.id):
         return
     if len(message.command) < 2:
-        return await message.reply_text(
-            "💀 <b>Usage:</b> <code>/userinfo [user_id]</code>",
-            parse_mode=ParseMode.HTML
-        )
+        return await message.reply_text("💀 <b>Usage:</b> <code>/userinfo [user_id]</code>", parse_mode=ParseMode.HTML)
     try:
         target_id = int(message.command[1])
         data = get_data()
         user = data["users"].get(str(target_id), {})
         if not user:
-            return await message.reply_text(
-                "❌ User not found.", parse_mode=ParseMode.HTML
-            )
+            return await message.reply_text("❌ User not found.", parse_mode=ParseMode.HTML)
 
-        user_accs = {
-            k: v for k, v in data["accounts"].items()
-            if v.get("user_id") == target_id
-        }
+        user_accs = {k: v for k, v in data["accounts"].items() if v.get("user_id") == target_id}
         camp = data["campaigns"].get(str(target_id), {})
         stats = data["stats"].get(str(target_id), {"total_sent": 0, "failed": 0})
         plan = get_user_plan_name(target_id)
@@ -4961,49 +5486,33 @@ async def userinfo_cmd(client, message: Message):
         camp_status = camp.get("status", "N/A")
         ref_count = len(data.get("referrals", {}).get(str(target_id), []))
 
-        status_map = {
-            "RUNNING": "🟢 RUNNING", "PAUSED": "🔴 PAUSED",
-            "COMPLETED": "✅ COMPLETED", "IDLE": "⚪ IDLE"
-        }
-        status_display = status_map.get(camp_status, "⚪ N/A")
-
+        status_map = {"RUNNING": "🟢", "PAUSED": "🔴", "COMPLETED": "✅", "IDLE": "⚪"}
+        status_icon = status_map.get(camp_status, "⚪")
         total_ops = stats["total_sent"] + stats["failed"]
         sr = round((stats["total_sent"] / total_ops * 100), 1) if total_ops > 0 else 0
 
         text = (
-            f"💀 <b>User Profile — Detailed</b>\n\n"
+            f"💀 <b>User Profile</b>\n\n"
             f"┌─────────────────────\n"
-            f"│ 👤 <b>Name:</b> {sanitize_html(user.get('name', 'N/A'))}\n"
-            f"│ 🆔 <b>ID:</b> <code>{target_id}</code>\n"
-            f"│ 🔗 <b>Username:</b> @{user.get('username', 'None')}\n"
-            f"│ 🌐 <b>Language:</b> {user.get('language', 'N/A')}\n"
-            f"│ 📅 <b>Joined:</b> {user.get('joined_date', 'N/A')}\n"
-            f"│ 🕐 <b>Last Active:</b> {user.get('last_active', 'N/A')}\n"
+            f"│ 👤 {sanitize_html(user.get('name', 'N/A'))}\n"
+            f"│ 🆔 <code>{target_id}</code> | @{user.get('username', 'None')}\n"
+            f"│ 📅 Joined: {user.get('joined_date', 'N/A')}\n"
+            f"│ 🕐 Active: {user.get('last_active', 'N/A')}\n"
             f"├─────────────────────\n"
-            f"│ 💎 <b>Plan:</b> {plan} ({plan_key})\n"
-            f"│ 👥 <b>Accounts:</b> <code>{len(user_accs)}/{limit}</code>\n"
-            f"│ 📱 <b>Phones:</b> {', '.join(phones) or 'None'}\n"
+            f"│ 💎 {plan} | 👥 {len(user_accs)}/{limit}\n"
+            f"│ 📱 {', '.join(phones) or 'None'}\n"
             f"├─────────────────────\n"
-            f"│ 🎯 <b>Targets:</b> <code>{len(camp.get('targets', []))}</code>\n"
-            f"│ 📊 <b>Campaign:</b> {status_display}\n"
-            f"│ ⏳ <b>Delay:</b> {camp.get('group_delay', 0)}s\n"
-            f"│ 🔄 <b>Round:</b> {camp.get('current_round', 0)}/{camp.get('total_rounds', 0)}\n"
-            f"├─────────────────────\n"
-            f"│ 🚀 <b>Sent:</b> <code>{stats['total_sent']:,}</code>\n"
-            f"│ ❌ <b>Failed:</b> <code>{stats['failed']:,}</code>\n"
-            f"│ 📈 <b>Success:</b> <code>{sr}%</code>\n"
-            f"│ 🔗 <b>Referrals:</b> <code>{ref_count}</code>\n"
-            f"│ 🚫 <b>Banned:</b> {'🔴 Yes' if is_banned else '🟢 No'}\n"
+            f"│ {status_icon} {camp_status} | 🎯 {len(camp.get('targets', []))}\n"
+            f"│ 🚀 Sent: {stats['total_sent']:,} | ❌ {stats['failed']:,} | 📈 {sr}%\n"
+            f"│ 🔗 Referrals: {ref_count} | {'🚫 BANNED' if is_banned else '✅ Active'}\n"
             f"└─────────────────────"
         )
         await message.reply_text(text, parse_mode=ParseMode.HTML)
     except ValueError:
         await message.reply_text("❌ Invalid ID.", parse_mode=ParseMode.HTML)
     except Exception as e:
-        await message.reply_text(
-            f"❌ Error: {sanitize_html(str(e)[:200])}",
-            parse_mode=ParseMode.HTML
-        )
+        logger.error(f"Userinfo error: {e}")
+        await message.reply_text(f"❌ Error: {sanitize_html(str(e)[:200])}", parse_mode=ParseMode.HTML)
 
 
 @bot.on_message(filters.command("listusers") & filters.private)
@@ -5013,18 +5522,14 @@ async def listusers_cmd(client, message: Message):
     data = get_data()
     users = list(data["users"].values())
     if not users:
-        return await message.reply_text(
-            "💀 No users found.", parse_mode=ParseMode.HTML
-        )
+        return await message.reply_text("💀 No users found.", parse_mode=ParseMode.HTML)
     users.sort(key=lambda x: x.get("joined_date", ""), reverse=True)
     text = f"💀 <b>All Users ({len(users)})</b>\n\n┌─────────────────────\n"
     for u in users[:30]:
         uid = u.get("user_id", "?")
         name = truncate_text(sanitize_html(u.get("name", "N/A")), 12)
-        plan = get_user_plan_name(uid) if isinstance(uid, int) else "?"
-        is_banned = uid in data.get("banned_users", [])
-        tag = " 🚫" if is_banned else ""
-        text += f"│ <code>{uid}</code>{tag} • {name} • {plan}\n"
+        tag = " 🚫" if uid in data.get("banned_users", []) else ""
+        text += f"│ <code>{uid}</code>{tag} • {name}\n"
     if len(users) > 30:
         text += f"│ ... +{len(users) - 30} more\n"
     text += "└─────────────────────"
@@ -5038,17 +5543,13 @@ async def listpremium_cmd(client, message: Message):
     data = get_data()
     premium = data.get("premium_users", {})
     if not premium:
-        return await message.reply_text(
-            "💀 No premium users.", parse_mode=ParseMode.HTML
-        )
+        return await message.reply_text("💀 No premium users.", parse_mode=ParseMode.HTML)
     text = f"💀 <b>Premium Users ({len(premium)})</b>\n\n┌─────────────────────\n"
     for uid_str, info in premium.items():
-        plan_key = info.get("plan", "?")
-        plan_name = PLANS.get(plan_key, {}).get("name", "?")
-        added = info.get("added_date", "N/A")[:10]
+        plan_name = PLANS.get(info.get("plan", "?"), {}).get("name", "?")
         user = data["users"].get(uid_str, {})
         name = truncate_text(sanitize_html(user.get("name", "N/A")), 12)
-        text += f"│ <code>{uid_str}</code> • {name} • {plan_name} • {added}\n"
+        text += f"│ <code>{uid_str}</code> • {name} • {plan_name}\n"
     text += "└─────────────────────"
     await message.reply_text(text, parse_mode=ParseMode.HTML)
 
@@ -5060,9 +5561,7 @@ async def listbanned_cmd(client, message: Message):
     data = get_data()
     banned = data.get("banned_users", [])
     if not banned:
-        return await message.reply_text(
-            "💀 No banned users.", parse_mode=ParseMode.HTML
-        )
+        return await message.reply_text("💀 No banned users.", parse_mode=ParseMode.HTML)
     text = f"💀 <b>Banned Users ({len(banned)})</b>\n\n┌─────────────────────\n"
     for b_id in banned[:30]:
         user = data["users"].get(str(b_id), {})
@@ -5079,35 +5578,24 @@ async def searchuser_cmd(client, message: Message):
     if not is_admin(message.from_user.id):
         return
     if len(message.command) < 2:
-        return await message.reply_text(
-            "💀 <b>Usage:</b> <code>/searchuser [query]</code>",
-            parse_mode=ParseMode.HTML
-        )
+        return await message.reply_text("💀 <b>Usage:</b> <code>/searchuser [query]</code>", parse_mode=ParseMode.HTML)
     query_str = " ".join(message.command[1:]).lower()
     data = get_data()
     results = []
     for uid_str, u in data["users"].items():
-        if (
-            query_str in str(u.get("user_id", "")).lower() or
-            query_str in u.get("name", "").lower() or
-            query_str in u.get("username", "").lower()
-        ):
+        if (query_str in str(u.get("user_id", "")).lower() or
+                query_str in u.get("name", "").lower() or
+                query_str in u.get("username", "").lower()):
             results.append((uid_str, u))
-
     if not results:
-        return await message.reply_text(
-            "💀 No users found.", parse_mode=ParseMode.HTML
-        )
-
-    text = f"💀 <b>Search: '{sanitize_html(query_str)}' ({len(results)} found)</b>\n\n┌─────────────────────\n"
+        return await message.reply_text("💀 No users found.", parse_mode=ParseMode.HTML)
+    text = f"💀 <b>Search: '{sanitize_html(query_str)}' ({len(results)})</b>\n\n┌─────────────────────\n"
     for uid_str, u in results[:15]:
         uid = u.get("user_id", "?")
         name = truncate_text(sanitize_html(u.get("name", "N/A")), 12)
         uname = f"@{u['username']}" if u.get("username") else "No @"
-        plan = get_user_plan_name(uid) if isinstance(uid, int) else "?"
-        is_banned = uid in data.get("banned_users", [])
-        tag = " 🚫" if is_banned else ""
-        text += f"│ <code>{uid}</code>{tag} • {name} • {uname}\n│ {plan}\n│\n"
+        tag = " 🚫" if uid in data.get("banned_users", []) else ""
+        text += f"│ <code>{uid}</code>{tag} • {name} • {uname}\n"
     if len(results) > 15:
         text += f"│ ... +{len(results) - 15} more\n"
     text += "└─────────────────────"
@@ -5120,75 +5608,55 @@ async def broadcast_cmd(client, message: Message):
         return
     data = get_data()
     total = len(data["users"])
-    msg = await message.reply_text(
-        f"📢 <b>Broadcast Starting...</b>\n"
-        f"Target: <code>{total}</code> users",
-        parse_mode=ParseMode.HTML
-    )
+    msg = await message.reply_text(f"📢 <b>Broadcasting to {total} users...</b>", parse_mode=ParseMode.HTML)
     s, f_count = 0, 0
     for uid_str in data["users"]:
         try:
             await message.reply_to_message.copy(int(uid_str))
             s += 1
+        except FloodWait as e:
+            await asyncio.sleep(e.value + 1)
+            try:
+                await message.reply_to_message.copy(int(uid_str))
+                s += 1
+            except Exception:
+                f_count += 1
         except Exception:
             f_count += 1
         await asyncio.sleep(0.05)
-
-    data = get_data()
+    data = await async_get_data()
     data["settings"]["total_broadcasts"] = data["settings"].get("total_broadcasts", 0) + 1
-    update_data(data)
+    await async_update_data(data)
     add_admin_log("BROADCAST", message.from_user.id, f"Sent: {s}, Failed: {f_count}")
-
     await msg.edit_text(
-        f"💀 <b>Broadcast Done!</b>\n\n"
-        f"┌─────────────────────\n"
-        f"│ ✅ Sent: <code>{s}</code>\n"
-        f"│ ❌ Failed: <code>{f_count}</code>\n"
-        f"│ 📊 Total: <code>{total}</code>\n"
-        f"└─────────────────────",
-        parse_mode=ParseMode.HTML
-    )
+        f"💀 <b>Broadcast Done!</b>\n│ ✅ Sent: {s} | ❌ Failed: {f_count} | 📊 Total: {total}",
+        parse_mode=ParseMode.HTML)
 
 
 @bot.on_message(filters.command("getdb") & filters.private)
 async def getdb_cmd(client, message: Message):
     if not is_admin(message.from_user.id):
         return
+    backup_file = f"skull_backup_{int(time.time())}.json"
     try:
         data = get_data()
-        backup = {
-            "backup_info": {
-                "created_at": time.strftime('%Y-%m-%d %H:%M:%S'),
-                "version": f"SkullAdsBot_v{BOT_VERSION}",
-                "total_users": len(data.get("users", {})),
-                "total_accounts": len(data.get("accounts", {}))
-            },
-            "data": data
-        }
-        backup_file = f"skull_backup_{int(time.time())}.json"
+        backup = {"backup_info": {"created_at": time.strftime('%Y-%m-%d %H:%M:%S'),
+            "version": f"v{BOT_VERSION}"}, "data": data}
         with open(backup_file, "w", encoding="utf-8") as f:
             json.dump(backup, f, indent=2, ensure_ascii=False)
-        file_size = get_readable_size(os.path.getsize(backup_file))
-        await message.reply_document(
-            document=backup_file,
-            caption=(
-                f"💀 <b>Database Backup</b>\n\n"
-                f"┌─────────────────────\n"
-                f"│ 📅 {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"│ 👥 Users: <code>{len(data.get('users', {}))}</code>\n"
-                f"│ 🔑 Accounts: <code>{len(data.get('accounts', {}))}</code>\n"
-                f"│ 💾 Size: <code>{file_size}</code>\n"
-                f"└─────────────────────"
-            ),
-            parse_mode=ParseMode.HTML
-        )
-        os.remove(backup_file)
+        await message.reply_document(document=backup_file,
+            caption=f"💀 <b>DB Backup</b>\n👥 {len(data.get('users', {}))} users | 🔑 {len(data.get('accounts', {}))} accounts",
+            parse_mode=ParseMode.HTML)
         add_admin_log("DOWNLOAD_DB", message.from_user.id)
     except Exception as e:
-        await message.reply_text(
-            f"❌ Error: {sanitize_html(str(e)[:200])}",
-            parse_mode=ParseMode.HTML
-        )
+        logger.error(f"getdb error: {e}")
+        await message.reply_text(f"❌ Error: {sanitize_html(str(e)[:200])}", parse_mode=ParseMode.HTML)
+    finally:
+        if os.path.exists(backup_file):
+            try:
+                os.remove(backup_file)
+            except Exception:
+                pass
 
 
 @bot.on_message(filters.command("uploaddb") & filters.private)
@@ -5196,74 +5664,50 @@ async def uploaddb_cmd(client, message: Message):
     if not is_admin(message.from_user.id):
         return
     if not message.reply_to_message or not message.reply_to_message.document:
-        return await message.reply_text(
-            "💀 Reply to a JSON file with <code>/uploaddb</code>",
-            parse_mode=ParseMode.HTML
-        )
-    wait_msg = await message.reply_text(
-        "⏳ <b>Restoring database...</b>",
-        parse_mode=ParseMode.HTML
-    )
+        return await message.reply_text("💀 Reply to a JSON file with <code>/uploaddb</code>", parse_mode=ParseMode.HTML)
+    wait_msg = await message.reply_text("⏳ <b>Restoring database...</b>", parse_mode=ParseMode.HTML)
+    temp_file = f"temp_upload_{int(time.time())}.json"
     try:
-        temp_file = f"temp_upload_{int(time.time())}.json"
         await message.reply_to_message.download(temp_file)
         with open(temp_file, "r", encoding="utf-8") as f:
             uploaded = json.load(f)
-        os.remove(temp_file)
-
         if "backup_info" in uploaded and "data" in uploaded:
             new_data = uploaded["data"]
         elif "users" in uploaded:
             new_data = uploaded
         else:
-            return await wait_msg.edit_text(
-                "❌ Invalid format! Must contain 'users' key.",
-                parse_mode=ParseMode.HTML
-            )
-
-        # Emergency backup
+            return await wait_msg.edit_text("❌ Invalid format!", parse_mode=ParseMode.HTML)
         current = get_data()
         emergency = f"pre_upload_{int(time.time())}.json"
         with open(emergency, "w", encoding="utf-8") as f:
             json.dump(current, f, indent=2)
-
-        update_data(new_data)
+        await async_update_data(new_data)
         add_admin_log("UPLOAD_DB", message.from_user.id, f"Backup: {emergency}")
-
         await wait_msg.edit_text(
-            f"💀 <b>Database Restored!</b>\n\n"
-            f"┌─────────────────────\n"
-            f"│ 👥 Users: <code>{len(new_data.get('users', {}))}</code>\n"
-            f"│ 🔑 Accounts: <code>{len(new_data.get('accounts', {}))}</code>\n"
-            f"│ 💾 Emergency backup: <code>{emergency}</code>\n"
-            f"│ ✅ Restored successfully!\n"
-            f"└─────────────────────",
-            parse_mode=ParseMode.HTML
-        )
+            f"💀 <b>Database Restored!</b>\n│ 👥 {len(new_data.get('users', {}))} users | 💾 {emergency}",
+            parse_mode=ParseMode.HTML)
     except json.JSONDecodeError:
-        await wait_msg.edit_text(
-            "❌ Invalid JSON file!", parse_mode=ParseMode.HTML
-        )
+        await wait_msg.edit_text("❌ Invalid JSON file!", parse_mode=ParseMode.HTML)
     except Exception as e:
-        await wait_msg.edit_text(
-            f"❌ Error: {sanitize_html(str(e)[:200])}",
-            parse_mode=ParseMode.HTML
-        )
+        logger.error(f"uploaddb error: {e}")
+        await wait_msg.edit_text(f"❌ Error: {sanitize_html(str(e)[:200])}", parse_mode=ParseMode.HTML)
+    finally:
+        if os.path.exists(temp_file):
+            try:
+                os.remove(temp_file)
+            except Exception:
+                pass
 
 
 @bot.on_message(filters.command("resetdb") & filters.private)
 async def resetdb_cmd(client, message: Message):
     if not is_admin(message.from_user.id):
         return
-    user_state[message.from_user.id] = {"step": "adm_confirm_reset"}
+    user_state[message.from_user.id] = {"step": "adm_confirm_reset", "_created": time.time()}
     await message.reply_text(
         "💀 <b>⚠️ DANGER: Full Database Reset</b>\n\n"
-        "This will DELETE ALL data permanently.\n"
-        "A backup will be created first.\n\n"
-        "Type <code>CONFIRM RESET</code> to proceed.\n"
-        "Type anything else to cancel.",
-        parse_mode=ParseMode.HTML
-    )
+        "Type <code>CONFIRM RESET</code> to proceed.\nAnything else = cancel.",
+        parse_mode=ParseMode.HTML)
 
 
 @bot.on_message(filters.command("globalfooter") & filters.private)
@@ -5272,30 +5716,20 @@ async def globalfooter_cmd(client, message: Message):
         return
     if len(message.command) < 2:
         data = get_data()
-        current = data["settings"].get("global_ad_footer", "None set")
+        current = data["settings"].get("global_ad_footer", "None")
         return await message.reply_text(
-            f"💀 <b>Global Footer</b>\n\n"
-            f"Current: <code>{sanitize_html(current or 'None')}</code>\n\n"
-            f"Usage: <code>/globalfooter [text]</code>\n"
-            f"Use <code>/globalfooter off</code> to disable.",
-            parse_mode=ParseMode.HTML
-        )
+            f"💀 <b>Global Footer:</b> <code>{sanitize_html(current or 'None')}</code>\n"
+            f"Usage: <code>/globalfooter [text]</code> or <code>off</code>", parse_mode=ParseMode.HTML)
     footer_text = " ".join(message.command[1:])
-    data = get_data()
+    data = await async_get_data()
     if footer_text.lower() in ["off", "none", "clear", "remove"]:
         data["settings"]["global_ad_footer"] = ""
-        update_data(data)
-        return await message.reply_text(
-            "✅ Global footer cleared!", parse_mode=ParseMode.HTML
-        )
+        await async_update_data(data)
+        return await message.reply_text("✅ Global footer cleared!", parse_mode=ParseMode.HTML)
     data["settings"]["global_ad_footer"] = footer_text
-    update_data(data)
+    await async_update_data(data)
     add_admin_log("SET_FOOTER", message.from_user.id, truncate_text(footer_text, 50))
-    await message.reply_text(
-        f"✅ <b>Global footer set!</b>\n\n"
-        f"<code>{sanitize_html(footer_text)}</code>",
-        parse_mode=ParseMode.HTML
-    )
+    await message.reply_text(f"✅ <b>Footer set!</b>\n<code>{sanitize_html(footer_text)}</code>", parse_mode=ParseMode.HTML)
 
 
 @bot.on_message(filters.command("forcejoin") & filters.private)
@@ -5306,31 +5740,21 @@ async def forcejoin_cmd(client, message: Message):
         data = get_data()
         current = data["settings"].get("force_join_channel", "Disabled")
         return await message.reply_text(
-            f"💀 <b>Force Join</b>\n\n"
-            f"Current: <code>{current or 'Disabled'}</code>\n\n"
-            f"Usage: <code>/forcejoin @channelname</code>\n"
-            f"Use <code>/forcejoin off</code> to disable.",
-            parse_mode=ParseMode.HTML
-        )
+            f"💀 <b>Force Join:</b> <code>{current or 'Disabled'}</code>\n"
+            f"Usage: <code>/forcejoin @channel</code> or <code>off</code>", parse_mode=ParseMode.HTML)
     channel = message.command[1].strip()
-    data = get_data()
+    data = await async_get_data()
     if channel.lower() in ["off", "none", "disable", "remove"]:
         data["settings"]["force_join_channel"] = ""
-        update_data(data)
-        return await message.reply_text(
-            "✅ Force join disabled!", parse_mode=ParseMode.HTML
-        )
+        await async_update_data(data)
+        return await message.reply_text("✅ Force join disabled!", parse_mode=ParseMode.HTML)
     if not channel.startswith("@"):
         channel = f"@{channel}"
     data["settings"]["force_join_channel"] = channel
-    update_data(data)
+    await async_update_data(data)
     add_admin_log("SET_FORCEJOIN", message.from_user.id, channel)
     await message.reply_text(
-        f"✅ <b>Force join set!</b>\n"
-        f"Channel: <code>{channel}</code>\n\n"
-        f"⚠️ Make sure bot is admin in the channel!",
-        parse_mode=ParseMode.HTML
-    )
+        f"✅ <b>Force join set!</b> Channel: <code>{channel}</code>\n⚠️ Bot must be admin!", parse_mode=ParseMode.HTML)
 
 
 @bot.on_message(filters.command("logs") & filters.private)
@@ -5340,10 +5764,8 @@ async def logs_cmd(client, message: Message):
     data = get_data()
     logs = data.get("admin_logs", [])
     if not logs:
-        return await message.reply_text(
-            "💀 No admin logs.", parse_mode=ParseMode.HTML
-        )
-    text = f"💀 <b>Recent Admin Logs ({len(logs)})</b>\n\n┌─────────────────────\n"
+        return await message.reply_text("💀 No admin logs.", parse_mode=ParseMode.HTML)
+    text = f"💀 <b>Recent Logs ({len(logs)})</b>\n\n┌─────────────────────\n"
     for log in logs[:20]:
         action = log.get("action", "?")
         ts = log.get("timestamp", "?")[:16]
@@ -5354,76 +5776,6 @@ async def logs_cmd(client, message: Message):
         text += f"│ ... +{len(logs) - 20} more\n"
     text += "└─────────────────────"
     await message.reply_text(text, parse_mode=ParseMode.HTML)
-
-
-# =====================================================
-# 📢 PREMIUM BROADCAST (from callback state)
-# =====================================================
-# Handle premium broadcast text in master_handler
-# We need to add this step handler
-
-@bot.on_message(
-    filters.private & filters.text &
-    ~filters.command(ADMIN_COMMANDS)
-)
-async def premium_broadcast_handler(client, message: Message):
-    """Handle premium-only broadcast text."""
-    u_id = message.from_user.id
-
-    if u_id not in user_state:
-        return
-
-    step = user_state[u_id].get("step")
-
-    if step == "adm_broadcast_premium_text":
-        if not is_admin(u_id):
-            return
-        del user_state[u_id]
-        data = get_data()
-        premium_ids = list(data.get("premium_users", {}).keys())
-
-        if not premium_ids:
-            return await message.reply_text(
-                "❌ No premium users to broadcast to!",
-                parse_mode=ParseMode.HTML
-            )
-
-        msg = await message.reply_text(
-            f"📢 <b>Premium Broadcast...</b>\n"
-            f"Target: <code>{len(premium_ids)}</code> premium users",
-            parse_mode=ParseMode.HTML
-        )
-
-        s, f_count = 0, 0
-        for uid_str in premium_ids:
-            try:
-                await bot.send_message(
-                    int(uid_str), message.text,
-                    parse_mode=ParseMode.HTML
-                )
-                s += 1
-            except Exception:
-                f_count += 1
-            await asyncio.sleep(0.05)
-
-        data = get_data()
-        data["settings"]["total_broadcasts"] = (
-            data["settings"].get("total_broadcasts", 0) + 1
-        )
-        update_data(data)
-        add_admin_log(
-            "PREMIUM_BROADCAST", u_id,
-            f"Sent: {s}, Failed: {f_count}"
-        )
-
-        await msg.edit_text(
-            f"💀 <b>Premium Broadcast Done!</b>\n\n"
-            f"┌─────────────────────\n"
-            f"│ ✅ Sent: <code>{s}</code>\n"
-            f"│ ❌ Failed: <code>{f_count}</code>\n"
-            f"└─────────────────────",
-            parse_mode=ParseMode.HTML
-        )
 
 
 # =====================================================
@@ -5439,10 +5791,10 @@ async def auto_backup_task():
                 backup_file = f"auto_backup_{int(time.time())}.json"
                 with open(backup_file, "w", encoding="utf-8") as f:
                     json.dump(data, f, indent=2)
-                data["settings"]["last_backup"] = time.strftime(
-                    '%Y-%m-%d %H:%M:%S'
-                )
-                update_data(data)
+
+                data = await async_get_data()
+                data["settings"]["last_backup"] = time.strftime('%Y-%m-%d %H:%M:%S')
+                await async_update_data(data)
                 logger.info(f"Auto backup created: {backup_file}")
 
                 # Clean old backups (keep last 5)
@@ -5455,8 +5807,10 @@ async def auto_backup_task():
                     try:
                         os.remove(oldest)
                         logger.info(f"Removed old backup: {oldest}")
-                    except Exception:
-                        pass
+                    except Exception as re:
+                        logger.debug(f"Could not remove old backup {oldest}: {re}")
+        except asyncio.CancelledError:
+            break
         except Exception as e:
             logger.error(f"Auto backup error: {e}")
 
@@ -5465,26 +5819,22 @@ async def auto_backup_task():
 # 🔧 STALE TASK CLEANER
 # =====================================================
 async def stale_task_cleaner():
-    """Clean up stale campaign tasks periodically."""
+    """Clean up stale campaign tasks and user states periodically."""
     while True:
         try:
             await asyncio.sleep(60)  # Check every minute
-            data = get_data()
 
             # Clean finished tasks
             for u_id in list(active_tasks.keys()):
                 task = active_tasks[u_id]
                 if task.done():
                     del active_tasks[u_id]
-                    # Check if exception occurred
                     try:
                         task.result()
                     except asyncio.CancelledError:
                         pass
                     except Exception as e:
-                        logger.warning(
-                            f"Task for {u_id} ended with error: {e}"
-                        )
+                        logger.warning(f"Task for {u_id} ended with error: {e}")
 
             # Clean stale user states (older than 30 minutes)
             now = time.time()
@@ -5492,21 +5842,22 @@ async def stale_task_cleaner():
                 state = user_state[u_id]
                 created = state.get("_created", now)
                 if now - created > 1800:  # 30 min
-                    # Disconnect any hanging clients
                     tc = state.get("client")
                     if tc:
                         try:
                             await tc.disconnect()
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.debug(f"Stale client disconnect for {u_id}: {e}")
                     del user_state[u_id]
                     logger.info(f"Cleaned stale state for user {u_id}")
 
-            # Clean rate limit tracker
+            # Clean old rate limit entries
             for key in list(rate_limit_tracker.keys()):
                 if now - rate_limit_tracker[key] > 300:
                     del rate_limit_tracker[key]
 
+        except asyncio.CancelledError:
+            break
         except Exception as e:
             logger.error(f"Stale cleaner error: {e}")
 
@@ -5521,14 +5872,15 @@ async def health_check_task():
             await asyncio.sleep(3600)  # Every hour
             s = get_system_stats()
             logger.info(
-                f"💀 Health Check | "
-                f"Users: {s['total_users']} | "
+                f"💀 Health | Users: {s['total_users']} | "
                 f"Sessions: {s['total_accounts']} | "
                 f"Running: {s['running']} | "
                 f"Tasks: {s['active_engine_tasks']} | "
                 f"Sent: {s['total_sent']:,} | "
-                f"Uptime: {s['uptime']}"
+                f"Up: {s['uptime']}"
             )
+        except asyncio.CancelledError:
+            break
         except Exception as e:
             logger.error(f"Health check error: {e}")
 
@@ -5545,14 +5897,15 @@ async def start_bot():
     print(f"🤖 Bot: @{BOT_USERNAME}")
     print(f"👑 Admins: {ADMIN_IDS}")
     print(f"💾 Data File: {DATA_FILE}")
+    print(f"📞 phonenumbers: {'✅' if PHONENUMBERS_AVAILABLE else '❌ (basic mode)'}")
     print("=" * 50)
 
     # Increment start count
-    data = get_data()
+    data = await async_get_data()
     data["settings"]["bot_start_count"] = (
         data["settings"].get("bot_start_count", 0) + 1
     )
-    update_data(data)
+    await async_update_data(data)
 
     logger.info("Starting Pyrogram client...")
     await bot.start()
@@ -5595,12 +5948,13 @@ async def start_bot():
                 f"│ 🚀 <b>Running:</b> <code>{s['running']}</code>\n"
                 f"│ ⏱️ <b>Start #:</b> <code>{s['bot_starts']}</code>\n"
                 f"│ 💾 <b>DB Size:</b> <code>{s['file_size_str']}</code>\n"
+                f"│ 📞 <b>PhoneLib:</b> {'✅' if PHONENUMBERS_AVAILABLE else '❌'}\n"
                 f"└─────────────────────\n\n"
                 f"All systems operational! ✅",
                 parse_mode=ParseMode.HTML
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Admin startup notify error: {e}")
 
     await idle()
 

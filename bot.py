@@ -404,7 +404,7 @@ def normalize_otp(raw: str) -> tuple:
     """
     Normalize OTP — accept ANY format.
     Extracts only digits. Works with:
-    - 12345 i
+    - 12345
     - 1 2 3 4 5
     - 1-2-3-4-5
     - 12 345
@@ -3089,8 +3089,8 @@ async def master_handler(client, message: Message):
                 "│\n"
                 "│ <b>Just type the OTP normally:</b>\n"
                 "│\n"
-                "│ ✅ <code>12345</code> — if error TRY 1 2 3 4 format  !\n"
-                "│ ✅ <code>@skulladsbot</code> — Always Free One !\n"
+                "│ ✅ <code>12345</code> — works!\n"
+                "│ ✅ <code>1 2 3 4 5</code> — Always works!\n"
                 "│ ✅ <code>1-2-3-4-5</code> — works!\n"
                 "│ ✅ <code>12 345</code> — works!\n"
                 "│\n"
@@ -3269,24 +3269,21 @@ async def master_handler(client, message: Message):
                     await tc.disconnect()
                 except Exception:
                     pass
-               if u_id in user_state:
+                if u_id in user_state:
                     del user_state[u_id]
                 return await message.reply_text(
                     "💀 <b>OTP Expired!</b>\n\n"
                     "┌─────────────────────\n"
                     "│ ⏰ The OTP has expired.\n"
                     "│ Please start login again.\n"
-                    "│\n"
-                    "│ 💡 Next time send OTP fast!\n"
-                    "│ Format: IF Error Again Then Try This format <code>1 2 3 4 5</code>\n"
-                    "│ Or just: <code>Try another Account</code>\n"
                     "└─────────────────────",
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton(
                             "🔁 Login Again", callback_data="login_acc"
                         )]
                     ]),
-                    parse_mode=Par
+                    parse_mode=ParseMode.HTML
+                )
 
             # Check if OTP is wrong
             if "PHONE_CODE_INVALID" in error_str.upper():

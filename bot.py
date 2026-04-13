@@ -1,10 +1,3 @@
-# =====================================================
-# 💀 SKULL ADS BOT v3.0 — COMPLETE SINGLE FILE
-# =====================================================
-# File: bot.py
-# Author: @itsukiarai
-# Support: @skullmodder | @botsarefather
-# =====================================================
 
 import asyncio
 import time

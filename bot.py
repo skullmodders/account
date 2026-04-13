@@ -623,8 +623,8 @@ async def send_welcome(msg_or_query, is_edit: bool = False):
         "├ 🔑 OTP & 2FA Secure Login\n"
         "├ 📈 Advanced Analytics\n"
         "└ 🔗 Referral System\n\n"
-        "👨‍💻 <b>Support:</b> @skullmodder\n"
-        "🤖 <b>Owner:</b> @botsarefather"
+        "👨‍💻 <b>Group:</b> @brzfire\n"
+        "🤖 <b>Owner:</b> @itsukaiarai"
     )
 
     markup = InlineKeyboardMarkup([
@@ -638,8 +638,8 @@ async def send_welcome(msg_or_query, is_edit: bool = False):
             InlineKeyboardButton("📊 Bot Stats", callback_data="public_stats")
         ],
         [
-            InlineKeyboardButton("💬 Support", url="https://t.me/skullmodder"),
-            InlineKeyboardButton("🤖 Owner", url="https://t.me/botsarefather")
+            InlineKeyboardButton("💬 Support", url="https://t.me/itsukiarai"),
+            InlineKeyboardButton("🤖 Owner", url="https://t.me/itsukiarai")
         ]
     ])
 
@@ -821,11 +821,11 @@ async def show_plans_cb(client, query: CallbackQuery):
     markup = InlineKeyboardMarkup([
         [InlineKeyboardButton(
             "💬 Buy — @skullmodder",
-            url="https://t.me/skullmodder"
+            url="https://t.me/itsukiarai"
         )],
         [InlineKeyboardButton(
-            "🤖 Owner — @botsarefather",
-            url="https://t.me/botsarefather"
+            "🤖 Owner ",
+            url="https://t.me/itsukiarai"
         )],
         [InlineKeyboardButton("🔙 Back", callback_data="back_start")]
     ])

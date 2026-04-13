@@ -73,7 +73,7 @@ API_HASH = "be8263da0b299567112d75c488ebb72c"
 BOT_TOKEN = "8209606686:AAGCnV1mRBIGLPI7I8J5MknbjQWf9bIxO7w"
 ADMIN_IDS = [7385209456]
 BOT_USERNAME = "SkullAdsBot"
-BOT_VERSION = "3.0"
+BOT_VERSION = "1.0"
 BOT_START_TIME = time.time()
 
 # ── Plan Configuration ────────────────────────────────
@@ -624,7 +624,7 @@ async def send_welcome(msg_or_query, is_edit: bool = False):
         "├ 📈 Advanced Analytics\n"
         "└ 🔗 Referral System\n\n"
         "👨‍💻 <b>Group:</b> @brzfire\n"
-        "🤖 <b>Owner:</b> @itsukaiarai"
+        "🤖 <b>Owner:</b> @itsukiarai"
     )
 
     markup = InlineKeyboardMarkup([

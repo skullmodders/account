@@ -3269,19 +3269,26 @@ async def master_handler(client, message: Message):
                     await tc.disconnect()
                 except Exception:
                     pass
-                if u_id in user_state:
+                              if u_id in user_state:
                     del user_state[u_id]
                 return await message.reply_text(
                     "💀 <b>OTP Expired!</b>\n\n"
                     "┌─────────────────────\n"
                     "│ ⏰ The OTP has expired.\n"
                     "│ Please start login again.\n"
+                    "│\n"
+                    "│ 💡 <b>Error In server so Next time send OTP like:</b>\n"
+                    "│ • <code>3 5 9 6</code>\n"
+                    "│ • <code>4 2 3 4 5</code>\n"
+                    "│ • <code>9 6 5 4</code>\n"
                     "└─────────────────────",
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton(
                             "🔁 Login Again", callback_data="login_acc"
                         )]
                     ]),
+                    parse_mode=ParseMode.HTML
+                )
                     parse_mode=ParseMode.HTML
                 )
 

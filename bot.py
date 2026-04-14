@@ -74,7 +74,7 @@ except Exception as e:
 API_ID = int(os.getenv("API_ID", "35179842"))
 API_HASH = os.getenv("API_HASH", "be8263da0b299567112d75c488ebb72c")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8770836520:AAHHfHaLgz7zlLISpoKVoRC9TaXlypGHrSA")
-ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "7385209456")
+ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "8624480309")
 ADMIN_IDS = [int(x.strip()) for x in ADMIN_IDS_RAW.split(",") if x.strip().isdigit()]
 
 # Validate required config
